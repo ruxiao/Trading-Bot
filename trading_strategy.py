@@ -13,13 +13,14 @@ class TradingStrategy:
             self.long_window,
             alpha_params[2],  # MA signal weight
             alpha_params[3],  # RSI oversold weight
-            alpha_params[4]   # RSI overbought weight
+            alpha_params[4],  # RSI overbought weight
+            alpha_params[5]   # Correlation weight
         ]
+        self.position_limits = (-1, 1)  # Allow both short (-1) and long (1) positions
 
-    def calculate_signal(self, data: pd.DataFrame) -> tuple:
+    def calculate_signal(self, data: pd.DataFrame, correlation_matrix: pd.DataFrame, symbol: str) -> tuple:
         """
-        Calculate trading signals based on alpha parameters
-        Alpha combines multiple technical indicators with weights from alpha_params
+        Calculate trading signals based on alpha parameters and correlation
         Returns signals and alpha values for analysis
         """
         signals = np.zeros(len(data))
@@ -40,8 +41,14 @@ class TradingStrategy:
         # Handle NaN values in RSI
         rsi = rsi.fillna(50)  # Fill NaN with neutral RSI value
 
+        # Calculate correlation component
+        # Average correlation with other assets
+        correlations = correlation_matrix[symbol].drop(symbol)
+        avg_correlation = correlations.mean()
+        correlation_signal = -avg_correlation  # Negative correlation is good for diversification
+
         # Alpha formula calculation
-        # Alpha = w1 * (Short MA - Long MA)/Long MA + w2 * (30 - RSI)/30 + w3 * (RSI - 70)/30
+        # Alpha = w1 * (Short MA - Long MA)/Long MA + w2 * (30 - RSI)/30 + w3 * (RSI - 70)/30 + w4 * correlation_signal
         ma_component = (ma_short - ma_long) / ma_long
         rsi_oversold = (30 - rsi) / 30
         rsi_overbought = (rsi - 70) / 30
@@ -51,10 +58,12 @@ class TradingStrategy:
         alpha_values = (
             self.alpha_params[2] * ma_component +
             self.alpha_params[3] * rsi_oversold +
-            self.alpha_params[4] * rsi_overbought
+            self.alpha_params[4] * rsi_overbought +
+            self.alpha_params[5] * correlation_signal
         )
 
-        signals = np.sign(alpha_values)
+        # Convert alpha values to position signals (-1 for short, 0 for neutral, 1 for long)
+        signals = np.clip(np.sign(alpha_values), self.position_limits[0], self.position_limits[1])
 
         # Create trade log
         position = 0
@@ -66,38 +75,51 @@ class TradingStrategy:
 
                 trade_log.append({
                     'date': date,
+                    'symbol': symbol,
                     'price': price,
                     'action': 'BUY' if new_position == 1 else 'SELL' if new_position == -1 else 'CLOSE',
                     'alpha_value': alpha_values[i],
                     'ma_short': ma_short.iloc[i],
                     'ma_long': ma_long.iloc[i],
-                    'rsi': rsi.iloc[i]
+                    'rsi': rsi.iloc[i],
+                    'correlation': correlation_signal
                 })
                 position = new_position
 
         return signals, alpha_values, trade_log
 
-    def backtest(self, data: pd.DataFrame) -> Dict:
+    def backtest_portfolio(self, data_dict: dict, correlation_matrix: pd.DataFrame) -> Dict:
         """
-        Backtest the trading strategy
+        Backtest the trading strategy across multiple assets
         Returns performance metrics and trade log
         """
-        signals, alpha_values, trade_log = self.calculate_signal(data)
+        all_signals = {}
+        all_returns = pd.DataFrame()
+        combined_trade_log = []
 
-        # Calculate returns
-        price_returns = data['Close'].pct_change().fillna(0)
-        strategy_returns = signals[:-1] * price_returns[1:]
+        # Calculate signals for each asset
+        for symbol, data in data_dict.items():
+            signals, alpha_values, trade_log = self.calculate_signal(data, correlation_matrix, symbol)
+            all_signals[symbol] = signals
 
-        # Calculate metrics
-        total_return = np.sum(strategy_returns)
-        sharpe_ratio = np.mean(strategy_returns) / np.std(strategy_returns) * np.sqrt(252) if np.std(strategy_returns) != 0 else 0
-        max_drawdown = np.min(np.maximum.accumulate(strategy_returns) - strategy_returns)
+            # Calculate returns
+            price_returns = data['Close'].pct_change().fillna(0)
+            strategy_returns = signals[:-1] * price_returns[1:]
+            all_returns[symbol] = strategy_returns
+
+            combined_trade_log.extend(trade_log)
+
+        # Calculate portfolio metrics
+        portfolio_returns = all_returns.mean(axis=1)  # Equal-weighted portfolio
+        total_return = np.prod(1 + portfolio_returns) - 1
+        sharpe_ratio = np.mean(portfolio_returns) / np.std(portfolio_returns) * np.sqrt(252) if np.std(portfolio_returns) != 0 else 0
+        max_drawdown = np.min(np.maximum.accumulate(portfolio_returns) - portfolio_returns)
 
         return {
             'total_return': total_return,
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
-            'returns': strategy_returns,
-            'alpha_values': alpha_values,
-            'trade_log': trade_log
+            'returns': portfolio_returns,
+            'trade_log': combined_trade_log,
+            'asset_returns': all_returns
         }

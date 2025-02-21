@@ -6,11 +6,13 @@ from genetic_algorithm import GeneticAlgorithm
 from trading_strategy import TradingStrategy
 from data_processor import DataProcessor
 from performance import PerformanceAnalyzer
+import plotly.graph_objects as go
+import plotly.express as px
 import zipfile
 import io
 import os
 
-st.set_page_config(page_title="Trading Agent Optimizer", layout="wide")
+st.set_page_config(page_title="Multi-Asset Trading Optimizer", layout="wide")
 
 # Initialize session state
 if 'best_params' not in st.session_state:
@@ -22,7 +24,6 @@ def create_source_code_zip():
     """Create a zip file containing all source code files"""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        # List of source files to include
         source_files = [
             "app.py",
             "data_processor.py",
@@ -31,14 +32,29 @@ def create_source_code_zip():
             "trading_strategy.py",
             ".streamlit/config.toml"
         ]
-
         for file_name in source_files:
             if os.path.exists(file_name):
                 zf.write(file_name)
-
     return zip_buffer.getvalue()
 
-def optimize_strategy(data: pd.DataFrame, 
+def plot_correlation_matrix(correlation_matrix):
+    """Create a heatmap of the correlation matrix"""
+    fig = px.imshow(
+        correlation_matrix,
+        labels=dict(color="Correlation"),
+        x=correlation_matrix.columns,
+        y=correlation_matrix.columns,
+        color_continuous_scale="RdBu",
+        aspect="auto"
+    )
+    fig.update_layout(
+        title="Asset Correlation Matrix",
+        height=600
+    )
+    return fig
+
+def optimize_strategy(data_dict: dict, 
+                     correlation_matrix: pd.DataFrame,
                      population_size: int,
                      generations: int,
                      mutation_rate: float) -> tuple:
@@ -46,11 +62,12 @@ def optimize_strategy(data: pd.DataFrame,
     Optimize trading strategy using genetic algorithm
     """
     param_ranges = [
-        (5, 50),    # Short MA window
-        (20, 200),  # Long MA window
-        (0, 2),     # MA signal weight
-        (0, 2),     # RSI oversold weight
-        (0, 2)      # RSI overbought weight
+        (5, 50),     # Short MA window
+        (20, 200),   # Long MA window
+        (0, 2),      # MA signal weight
+        (0, 2),      # RSI oversold weight
+        (0, 2),      # RSI overbought weight
+        (-1, 1)      # Correlation weight
     ]
 
     ga = GeneticAlgorithm(
@@ -62,7 +79,7 @@ def optimize_strategy(data: pd.DataFrame,
 
     def fitness_function(params):
         strategy = TradingStrategy(params)
-        results = strategy.backtest(data)
+        results = strategy.backtest_portfolio(data_dict, correlation_matrix)
         return results['sharpe_ratio']
 
     best_fitness = float('-inf')
@@ -84,7 +101,7 @@ def optimize_strategy(data: pd.DataFrame,
     return best_params, best_fitness
 
 # App layout
-st.title("Trading Agent Optimizer")
+st.title("Multi-Asset Trading Optimizer")
 
 # Sidebar
 st.sidebar.header("Parameters")
@@ -99,7 +116,14 @@ if st.sidebar.download_button(
 ):
     st.sidebar.success("Download started!")
 
-symbol = st.sidebar.text_input("Stock Symbol", value="AAPL")
+# Multiple stock selection
+st.sidebar.subheader("Stock Selection")
+default_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN"]
+symbols = st.sidebar.text_area(
+    "Enter stock symbols (one per line)",
+    value="\n".join(default_symbols)
+).split()
+
 lookback_days = st.sidebar.slider("Lookback Period (days)", 100, 1000, 252)
 population_size = st.sidebar.slider("Population Size", 10, 100, 50)
 generations = st.sidebar.slider("Generations", 10, 100, 30)
@@ -116,15 +140,26 @@ if st.button("Optimize Strategy"):
         end_date_str = end_date.strftime('%Y-%m-%d')
 
         with st.spinner("Fetching data..."):
-            data = DataProcessor.fetch_data(symbol, start_date_str, end_date_str)
-            data = DataProcessor.prepare_data(data)
+            data_dict = DataProcessor.fetch_multiple_data(symbols, start_date_str, end_date_str)
+            processed_data, correlation_matrix, volatility, returns = DataProcessor.prepare_data(data_dict)
+
+        # Display correlation matrix
+        st.subheader("Asset Correlation Analysis")
+        fig_corr = plot_correlation_matrix(correlation_matrix)
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+        # Display asset volatilities
+        st.subheader("Asset Volatilities (Annualized)")
+        vol_df = pd.DataFrame({'Symbol': volatility.index, 'Volatility': volatility.values})
+        st.dataframe(vol_df)
 
         # Optimize strategy
         st.write("Optimizing strategy...")
         progress_bar = st.progress(0)
 
         best_params, best_fitness = optimize_strategy(
-            data,
+            processed_data,
+            correlation_matrix,
             population_size,
             generations,
             mutation_rate
@@ -135,7 +170,7 @@ if st.button("Optimize Strategy"):
 
         # Test strategy with best parameters
         strategy = TradingStrategy(best_params)
-        performance = strategy.backtest(data)
+        performance = strategy.backtest_portfolio(processed_data, correlation_matrix)
         st.session_state.best_performance = performance
 
         # Display results
@@ -146,12 +181,13 @@ if st.button("Optimize Strategy"):
         st.markdown("""
         The trading signals are generated based on the following alpha formula:
         ```
-        Alpha = w1 * (Short MA - Long MA)/Long MA + w2 * (30 - RSI)/30 + w3 * (RSI - 70)/30
+        Alpha = w1 * (Short MA - Long MA)/Long MA + w2 * (30 - RSI)/30 + w3 * (RSI - 70)/30 + w4 * correlation_signal
 
         where:
         - w1 = {:.2f} (MA signal weight)
         - w2 = {:.2f} (RSI oversold weight)
         - w3 = {:.2f} (RSI overbought weight)
+        - w4 = {:.2f} (Correlation weight)
         - Short MA window = {}
         - Long MA window = {}
         ```
@@ -159,6 +195,7 @@ if st.button("Optimize Strategy"):
             best_params[2],
             best_params[3],
             best_params[4],
+            best_params[5],
             int(best_params[0]),
             int(best_params[1])
         ))
@@ -177,6 +214,7 @@ if st.button("Optimize Strategy"):
             display_log['ma_short'] = display_log['ma_short'].round(2)
             display_log['ma_long'] = display_log['ma_long'].round(2)
             display_log['rsi'] = display_log['rsi'].round(1)
+            display_log['correlation'] = display_log['correlation'].round(3)
 
             st.dataframe(display_log)
 
@@ -185,15 +223,14 @@ if st.button("Optimize Strategy"):
             st.download_button(
                 label="Download Trade Log",
                 data=csv,
-                file_name=f'trade_log_{symbol}.csv',
+                file_name="trade_log_portfolio.csv",
                 mime='text/csv',
             )
 
         # Performance metrics
-        st.subheader("Strategy Performance Report")
+        st.subheader("Portfolio Performance Report")
         metrics = PerformanceAnalyzer.calculate_metrics(performance['returns'])
 
-        # Display summary metrics in columns
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Return", f"{metrics['total_return']:.2%}")
         col2.metric("Annual Return", f"{metrics['annual_return']:.2%}")
