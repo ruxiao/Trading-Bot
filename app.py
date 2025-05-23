@@ -1,1025 +1,461 @@
 import streamlit as st
+import logging
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import pytz
-from genetic_algorithm import GeneticAlgorithm
+from ib_insync import Stock, Forex, Contract # For creating contract objects
+
+# Assuming your custom modules are in the same directory or accessible via PYTHONPATH
+from ibkr_client import IBKRClient
 from trading_strategy import TradingStrategy
-from data_processor import DataProcessor
-from performance import PerformanceAnalyzer
-import plotly.graph_objects as go
-import plotly.express as px
-import zipfile
-import io
-import os
-import time
-import json
+from performance import PerformanceAnalyzer # For displaying backtest results
+import config # For default connection params
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Advanced Trading System", layout="wide")
+# --- Global Variables & Configuration ---
+# Configure logging for the app
+# For Streamlit, consider using st.text_area for a simple log display
+class StreamlitLogHandler(logging.Handler):
+    def __init__(self, text_area_widget_key): # Pass key instead of widget
+        super().__init__()
+        self.text_area_widget_key = text_area_widget_key
+        if self.text_area_widget_key not in st.session_state:
+            st.session_state[self.text_area_widget_key] = []
 
-# Initialize session state
-if 'best_params' not in st.session_state:
-    st.session_state.best_params = None
-if 'best_performance' not in st.session_state:
-    st.session_state.best_performance = None
-if 'live_trading' not in st.session_state:
-    st.session_state.live_trading = False
-if 'live_strategy' not in st.session_state:
-    st.session_state.live_strategy = None
-if 'live_signals' not in st.session_state:
-    st.session_state.live_signals = []
-if 'portfolio_value' not in st.session_state:
-    st.session_state.portfolio_value = 100000
-if 'positions' not in st.session_state:
-    st.session_state.positions = {}
-if 'last_update' not in st.session_state:
-    st.session_state.last_update = None
+    def emit(self, record):
+        log_entry = self.format(record)
+        st.session_state[self.text_area_widget_key].append(log_entry)
+        # Keep last N records to prevent slowdown
+        if len(st.session_state[self.text_area_widget_key]) > 200: # Increased limit
+            st.session_state[self.text_area_widget_key] = st.session_state[self.text_area_widget_key][-200:]
+        # No direct widget update here, Streamlit handles it on rerun
 
-def create_source_code_zip():
-    """Create a zip file containing all source code files"""
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        source_files = [
-            "app.py",
-            "data_processor.py",
-            "genetic_algorithm.py",
-            "performance.py",
-            "trading_strategy.py",
-            ".streamlit/config.toml"
-        ]
-        for file_name in source_files:
-            if os.path.exists(file_name):
-                zf.write(file_name)
-    return zip_buffer.getvalue()
+logger = logging.getLogger() # Get root logger
+logger.setLevel(logging.INFO)
 
-def plot_correlation_matrix(correlation_matrix):
-    """Create a heatmap of the correlation matrix"""
-    fig = px.imshow(
-        correlation_matrix,
-        labels=dict(color="Correlation"),
-        x=correlation_matrix.columns,
-        y=correlation_matrix.columns,
-        color_continuous_scale="RdBu",
-        aspect="auto"
-    )
-    fig.update_layout(
-        title="Asset Correlation Matrix",
-        height=600
-    )
-    return fig
+# Remove existing handlers to prevent duplication if script reruns in some environments (less common with Streamlit)
+if logger.hasHandlers():
+    for handler in logger.handlers[:]: # Iterate over a copy
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, StreamlitLogHandler): # Keep only our Streamlit handler if it was added
+            logger.removeHandler(handler)
 
-def optimize_strategy(data_dict: dict, 
-                     correlation_matrix: pd.DataFrame,
-                     population_size: int,
-                     generations: int,
-                     mutation_rate: float,
-                     risk_params: dict) -> tuple:
+
+# --- Streamlit Session State Initialization ---
+default_states = {
+    'ibkr_client': None,
+    'trading_strategy': None,
+    'live_trading_active': False,
+    'subscribed_contracts': {}, # Stores {symbol_str: Contract}
+    'active_subscriptions': {}, # Stores {symbol_str: BarDataList_obj}
+    'backtest_results': None,
+    'backtest_trade_log': pd.DataFrame(),
+    'backtest_equity_curve': pd.DataFrame(),
+    'app_logs': [] # Initialize log storage in session state
+}
+for key, value in default_states.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# --- Helper Functions ---
+def get_contract_object(symbol_input: str) -> Contract | None:
     """
-    Optimize trading strategy using genetic algorithm
+    Creates an IB Contract object from a symbol string.
+    Assumes Stocks on SMART in USD, or Forex pairs.
+
+    Args:
+        symbol_input (str): The symbol string (e.g., "AAPL", "EURUSD", "EUR.USD").
+
+    Returns:
+        Contract | None: An ib_insync Contract object or None if input is invalid.
     """
-    param_ranges = [
-        (5, 50),     # Short MA window
-        (20, 200),   # Long MA window
-        (0, 2),      # MA signal weight
-        (0, 2),      # RSI oversold weight
-        (0, 2),      # RSI overbought weight
-        (-1, 1)      # Correlation weight
-    ]
+    symbol_input = symbol_input.strip().upper()
+    if not symbol_input: return None
+    # Basic check for Forex pairs (e.g., EURUSD, EUR.USD)
+    if '.' in symbol_input or (len(symbol_input) == 6 and not any(char.isdigit() for char in symbol_input)):
+        # ib_insync's Forex contract typically doesn't use '.', so remove it.
+        return Forex(symbol_input.replace('.', ''))
+    else: # Assume it's a stock
+        return Stock(symbol_input, 'SMART', 'USD')
 
-    ga = GeneticAlgorithm(
-        population_size=population_size,
-        mutation_rate=mutation_rate
-    )
+# --- UI Callbacks ---
+def handle_connect():
+    """
+    Handles the 'Connect' button action.
+    Establishes a connection to IBKR TWS/Gateway using parameters from session state
+    (defaulting to config.py values) and manages the asyncio event loop.
+    Updates session state with the IBKRClient instance.
+    """
+    logger.info("Attempting to connect to IBKR...")
+    host = st.session_state.get('ibkr_host_input', config.IBKR_HOST)
+    port = st.session_state.get('ibkr_port_input', config.IBKR_PORT)
+    client_id = st.session_state.get('ibkr_client_id_input', config.IBKR_CLIENT_ID)
 
-    population = ga.initialize_population(param_ranges)
+    # Prevent multiple connection attempts if already connected
+    if st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected():
+        st.sidebar.warning("Already connected.")
+        logger.warning("Connection attempt while already connected.")
+        return
 
-    def fitness_function(params):
-        strategy = TradingStrategy(
-            params,
-            transaction_cost=risk_params['transaction_cost'],
-            slippage=risk_params['slippage'],
-            risk_per_trade=risk_params['risk_per_trade'],
-            max_position_size=risk_params['max_position_size'],
-            stop_loss_pct=risk_params['stop_loss'],
-            take_profit_pct=risk_params['take_profit'],
-            volatility_scaling=risk_params['vol_scaling']
-        )
-        results = strategy.backtest_portfolio(
-            data_dict, 
-            correlation_matrix,
-            initial_capital=risk_params['initial_capital']
-        )
-        return results['sharpe_ratio']
+    try:
+        # Instantiate the client
+        client = IBKRClient(host=host, port=port, clientId=client_id)
+        client.connect() # Attempt connection
+        
+        # Start or patch the asyncio event loop, crucial for ib_insync callbacks
+        if client.run_async_event_loop_if_needed():
+            st.session_state.ibkr_client = client # Store client in session state
+            st.sidebar.success(f"Connected: {host}:{port} (ID: {client_id})")
+            logger.info(f"IBKR connection successful: {host}:{port}, ClientID {client_id}.")
+        else:
+            # If loop management fails, connection might be unstable for callbacks
+            st.sidebar.error("Loop Error. Callbacks may fail.")
+            logger.error("IBKR connected but event loop management failed.")
+            try: client.disconnect() # Attempt to clean up
+            except Exception as e_disc: logger.error(f"Error disconnecting after loop fail: {e_disc}")
+    except Exception as e:
+        st.sidebar.error(f"Connection Failed: {str(e)}")
+        logger.error(f"IBKR connection error: {e}", exc_info=True)
 
-    best_fitness = float('-inf')
-    best_params = None
+def handle_disconnect():
+    """
+    Handles the 'Disconnect' button action.
+    Stops live trading if active, disconnects from IBKR, and clears related session state.
+    """
+    logger.info("Attempting to disconnect from IBKR...")
+    if st.session_state.live_trading_active:
+        handle_stop_trading() # Ensure live trading is stopped first
 
-    for gen in range(generations):
-        population, gen_best_fitness = ga.evolve(
-            population, 
-            fitness_function,
-            param_ranges
-        )
-
-        if gen_best_fitness > best_fitness:
-            best_fitness = gen_best_fitness
-            best_params = population[0]
-
-        progress_bar.progress((gen + 1) / generations)
-
-    return best_params, best_fitness
-
-def fetch_latest_data(symbols, lookback_days=60):
-    """Fetch the latest market data for live trading"""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=lookback_days)
-
-    start_date_str = start_date.strftime('%Y-%m-%d')
-    end_date_str = end_date.strftime('%Y-%m-%d')
-
-    data_dict = DataProcessor.fetch_multiple_data(symbols, start_date_str, end_date_str)
-    processed_data, correlation_matrix, volatility, returns = DataProcessor.prepare_data(data_dict)
+    client = st.session_state.ibkr_client
+    if client and client.ib.isConnected():
+        try:
+            client.disconnect() # IBKRClient.disconnect handles cancelling subscriptions
+            st.sidebar.info("Disconnected from IBKR.")
+            logger.info("Successfully disconnected from IBKR.")
+        except Exception as e:
+            st.sidebar.error(f"Disconnect Error: {str(e)}")
+            logger.error(f"Error during IBKR disconnection: {e}", exc_info=True)
+    # If not connected, no specific warning needed as it's the desired state or already handled.
     
-    return processed_data, correlation_matrix, volatility, returns
+    # Clear all IBKR and trading related session state
+    st.session_state.ibkr_client = None
+    st.session_state.subscribed_contracts.clear()
+    st.session_state.active_subscriptions.clear()
+    st.session_state.live_trading_active = False 
+    st.session_state.trading_strategy = None # Clear strategy object
 
-def simulate_live_trading():
-    """Simulates live trading with the current strategy"""
-    if st.session_state.live_strategy is None:
+
+def handle_start_trading():
+    """
+    Handles the 'Start Live Trading' button action.
+    Initializes the TradingStrategy, subscribes to real-time bars for selected symbols,
+    and sets the application to live trading mode.
+    """
+    logger.info("Attempting to start live paper trading...")
+    client = st.session_state.ibkr_client # IBKRClient instance from session state
+    if not client or not client.ib.isConnected():
+        st.error("Not connected to IBKR. Please connect first.")
+        logger.warning("Start trading attempt without IBKR connection.")
+        return
+    if st.session_state.live_trading_active:
+        st.warning("Live trading is already active.")
+        return
+
+    # Get parameters from UI via session state
+    symbols_str = st.session_state.get('live_symbols_input', "AAPL,TSLA") # Default if key missing
+    initial_capital = st.session_state.get('live_initial_capital_input', 100000.0)
+    alpha_short_ma = st.session_state.get('live_alpha_short_ma', 10) # Default value for short MA
+    alpha_long_ma = st.session_state.get('live_alpha_long_ma', 20)   # Default value for long MA
+    
+    if not symbols_str:
+        st.error("Please enter symbols for live trading.")
         return
     
-    # Fetch latest data
-    symbols = [pos for pos in st.session_state.positions.keys()]
-    
-    try:
-        current_data, correlation_matrix, _, _ = fetch_latest_data(symbols)
-        
-        # Process signals
-        signals = st.session_state.live_strategy.process_live_data(current_data, correlation_matrix)
-        
-        # Update session state
-        st.session_state.live_signals = signals
-        st.session_state.last_update = datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d %H:%M:%S")
-        
-        # In a real system, this would execute trades
-        # For simulation, we'll just log the signals
-        
-        return signals
-    except Exception as e:
-        st.error(f"Error in live trading: {str(e)}")
-        return None
+    symbols_list = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+    if not symbols_list:
+        st.error("No valid symbols entered for live trading.")
+        return
 
-def format_position_sizing_params(risk_params):
-    """Format position sizing parameters for display"""
-    return f"""
-    - Initial Capital: ${risk_params['initial_capital']:,.2f}
-    - Risk Per Trade: {risk_params['risk_per_trade'] * 100:.1f}%
-    - Max Position Size: {risk_params['max_position_size'] * 100:.1f}%
-    - Stop Loss: {risk_params['stop_loss'] * 100:.1f}%
-    - Take Profit: {risk_params['take_profit'] * 100:.1f}%
-    - Transaction Cost: {risk_params['transaction_cost'] * 10000:.1f} bps
-    - Slippage: {risk_params['slippage'] * 10000:.1f} bps
-    - Volatility Scaling: {"Enabled" if risk_params['vol_scaling'] else "Disabled"}
+    # Construct alpha parameters list for TradingStrategy
+    alpha_params = [
+        alpha_short_ma, alpha_long_ma, 
+        st.session_state.get('live_alpha_ma_weight', 0.6),       # Default MA weight
+        st.session_state.get('live_alpha_rsi_os_weight', 0.25),  # Default RSI oversold weight
+        st.session_state.get('live_alpha_rsi_ob_weight', -0.25), # Default RSI overbought weight
+        st.session_state.get('live_alpha_corr_weight', 0.15)     # Default Correlation weight
+    ]
+    # Create a new TradingStrategy instance for this session
+    strategy = TradingStrategy(alpha_params=alpha_params)
+    strategy.start_live_trading(initial_capital=initial_capital, ibkr_client_instance=client)
+    st.session_state.trading_strategy = strategy # Store this active strategy
+    
+    # Clear any previous subscription states before starting new ones
+    st.session_state.subscribed_contracts.clear()
+    st.session_state.active_subscriptions.clear()
+    
+    success_symbols, failed_symbols = [], []
+    for sym_str in symbols_list:
+        contract = get_contract_object(sym_str) # Create contract object
+        if not contract:
+            failed_symbols.append(f"{sym_str} (Invalid contract format)")
+            continue
+        try:
+            logger.info(f"Subscribing to real-time bars for {sym_str}...")
+            # The strategy's on_realtime_bar method is passed as the callback
+            bars_obj = client.subscribe_realtime_bars(contract, strategy.on_realtime_bar)
+            if bars_obj and hasattr(bars_obj, 'contract'): # Check if subscription was successful
+                # Store the qualified contract (returned by subscribe_realtime_bars within bars_obj)
+                # and the BarDataList object for potential cancellation later.
+                st.session_state.subscribed_contracts[sym_str] = bars_obj.contract 
+                st.session_state.active_subscriptions[sym_str] = bars_obj
+                success_symbols.append(f"{sym_str} (ConID: {bars_obj.contract.conId})")
+                logger.info(f"Successfully subscribed to {sym_str} (ConID: {bars_obj.contract.conId}).")
+            else:
+                logger.error(f"Subscription failed for {sym_str}. Contract: {contract}, Received: {bars_obj}")
+                failed_symbols.append(f"{sym_str} (Subscription failed: No valid bars object returned)")
+        except Exception as e:
+            logger.error(f"Error subscribing to {sym_str}: {e}", exc_info=True)
+            failed_symbols.append(f"{sym_str} (Error: {str(e)[:50]}...)") # Show truncated error
+
+    if success_symbols:
+        st.success(f"Live trading started for: {', '.join(success_symbols)}.")
+        st.session_state.live_trading_active = True # Set global flag
+    if failed_symbols:
+        st.error(f"Failed to start/subscribe for: {', '.join(failed_symbols)}.")
+
+
+def handle_stop_trading():
     """
+    Handles the 'Stop Live Trading' button action.
+    Cancels all active real-time bar subscriptions and stops the trading strategy.
+    The IBKR connection remains active.
+    """
+    logger.info("Attempting to stop live trading...")
+    client = st.session_state.ibkr_client # Get client from session state
+    strategy = st.session_state.trading_strategy # Get strategy from session state
 
-# App layout
-st.title("Advanced Trading System")
+    if strategy:
+        strategy.stop_live_trading() # Notify strategy to stop
+    
+    cancelled_symbols, failed_cancellation = [], []
+    if client and st.session_state.active_subscriptions: # Check if client and subscriptions exist
+        # Iterate over a copy of items because cancel_realtime_bars might modify the dict via callbacks or internal state
+        for sym_str, bars_obj in list(st.session_state.active_subscriptions.items()):
+            try:
+                logger.info(f"Attempting to cancel subscription for {sym_str} using object: {bars_obj}")
+                client.cancel_realtime_bars(bars_obj) # Pass the BarDataList object
+                cancelled_symbols.append(sym_str)
+                logger.info(f"Cancelled real-time bar subscription for {sym_str}.")
+            except Exception as e:
+                failed_cancellation.append(f"{sym_str} (Error: {str(e)})")
+                logger.error(f"Error cancelling subscription for {sym_str}: {e}", exc_info=True)
+    
+    if cancelled_symbols: st.info(f"Successfully unsubscribed from: {', '.join(cancelled_symbols)}")
+    if failed_cancellation: st.error(f"Failed to unsubscribe from: {', '.join(failed_cancellation)}")
 
-# Tabs for different functions
-tab1, tab2, tab3 = st.tabs(["Strategy Optimization", "Live Trading Simulator", "Market Analysis"])
+    st.session_state.live_trading_active = False # Update global flag
+    st.session_state.active_subscriptions.clear() # Clear active subscription objects
+    st.session_state.subscribed_contracts.clear() # Clear stored contracts
+    # Keep st.session_state.trading_strategy to allow viewing of final state (capital, logs)
+    st.info("Live trading stopped. Connection to IBKR remains active unless disconnected separately.")
 
-with tab1:
-    # Sidebar for Optimization
-    st.sidebar.header("Optimization Parameters")
+
+def handle_run_backtest():
+    """
+    Handles the 'Run Backtest' button action.
+    Fetches historical data via IBKRClient, runs the TradingStrategy's event-driven backtest,
+    and stores/displays the results.
+    """
+    logger.info("Attempting to run event-driven backtest...")
+    client = st.session_state.ibkr_client
+    if not client or not client.ib.isConnected():
+        st.error("Not connected to IBKR. Please connect first to fetch historical data.")
+        return
+
+    symbols_str = st.session_state.get('backtest_symbols_input', "AAPL,MSFT")
+    start_date = st.session_state.get('backtest_start_date_input', datetime.now() - timedelta(days=90))
+    end_date = st.session_state.get('backtest_end_date_input', datetime.now() - timedelta(days=1))
+    bar_size = st.session_state.get('backtest_bar_size_input', "1 day")
+    initial_capital = st.session_state.get('backtest_initial_capital_input', 100000.0)
+    alpha_short_ma_bt = st.session_state.get('bt_alpha_short_ma', 10)
+    alpha_long_ma_bt = st.session_state.get('bt_alpha_long_ma', 20)
+
+    if not symbols_str:
+        st.error("Please enter symbols for backtesting."); return
+    symbols_list = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+    if not symbols_list:
+        st.error("No valid symbols entered for backtesting."); return
+    if end_date <= start_date:
+        st.error("End date must be after start date."); return
+
+    contracts_to_backtest = {}
+    for sym_str in symbols_list:
+        contract = get_contract_object(sym_str)
+        if contract: contracts_to_backtest[sym_str] = contract
+        else: st.error(f"Invalid symbol format for backtesting: {sym_str}"); return
     
-    # Add download button in sidebar
-    st.sidebar.markdown("### Download Source Code")
-    if st.sidebar.download_button(
-        label="Download Project Files",
-        data=create_source_code_zip(),
-        file_name="trading_strategy_project.zip",
-        mime="application/zip"
-    ):
-        st.sidebar.success("Download started!")
+    alpha_params_bt = [
+        alpha_short_ma_bt, alpha_long_ma_bt, 
+        st.session_state.get('bt_alpha_ma_weight', 0.6),
+        st.session_state.get('bt_alpha_rsi_os_weight', 0.25),
+        st.session_state.get('bt_alpha_rsi_ob_weight', -0.25),
+        st.session_state.get('bt_alpha_corr_weight', 0.15)
+    ]
+    backtest_strategy = TradingStrategy(alpha_params=alpha_params_bt)
     
-    # Multiple stock selection
-    st.sidebar.subheader("Stock Selection")
-    default_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN"]
-    symbols = st.sidebar.text_area(
-        "Enter stock symbols (one per line)",
-        value="\n".join(default_symbols)
-    ).split()
-    
-    lookback_days = st.sidebar.slider("Lookback Period (days)", 100, 1000, 252)
-    population_size = st.sidebar.slider("Population Size", 10, 100, 50)
-    generations = st.sidebar.slider("Generations", 10, 100, 30)
-    mutation_rate = st.sidebar.slider("Mutation Rate", 0.0, 1.0, 0.1)
-    
-    # Risk management parameters
-    st.sidebar.subheader("Risk Management")
-    initial_capital = st.sidebar.number_input("Initial Capital ($)", 
-                                            min_value=10000, 
-                                            max_value=10000000, 
-                                            value=100000,
-                                            step=10000)
-    
-    risk_per_trade = st.sidebar.slider("Risk Per Trade (%)", 0.5, 5.0, 2.0) / 100
-    max_position = st.sidebar.slider("Max Position Size (%)", 5.0, 50.0, 20.0) / 100
-    stop_loss = st.sidebar.slider("Stop Loss (%)", 1.0, 10.0, 2.0) / 100
-    take_profit = st.sidebar.slider("Take Profit (%)", 1.0, 20.0, 3.0) / 100
-    
-    # Transaction costs
-    transaction_cost = st.sidebar.slider("Transaction Cost (bps)", 0.0, 50.0, 5.0) / 10000
-    slippage = st.sidebar.slider("Slippage (bps)", 0.0, 30.0, 3.0) / 10000
-    
-    # Advanced settings
-    vol_scaling = st.sidebar.checkbox("Enable Volatility Scaling", value=True)
-    
-    # Collect risk parameters
-    risk_params = {
-        'initial_capital': initial_capital,
-        'risk_per_trade': risk_per_trade,
-        'max_position_size': max_position,
-        'stop_loss': stop_loss,
-        'take_profit': take_profit,
-        'transaction_cost': transaction_cost,
-        'slippage': slippage,
-        'vol_scaling': vol_scaling
-    }
-    
-    # Main optimization content
-    if st.button("Optimize Strategy"):
+    with st.spinner(f"Running backtest for {', '.join(symbols_list)}..."):
         try:
-            # Fetch and prepare data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=lookback_days)
-    
-            start_date_str = start_date.strftime('%Y-%m-%d')
-            end_date_str = end_date.strftime('%Y-%m-%d')
-    
-            with st.spinner("Fetching market data..."):
-                data_dict = DataProcessor.fetch_multiple_data(symbols, start_date_str, end_date_str)
-                processed_data, correlation_matrix, volatility, returns = DataProcessor.prepare_data(data_dict)
-    
-            # Display correlation matrix
-            st.subheader("Asset Correlation Analysis")
-            fig_corr = plot_correlation_matrix(correlation_matrix)
-            st.plotly_chart(fig_corr, use_container_width=True)
-    
-            # Display asset volatilities
-            st.subheader("Asset Volatilities (Annualized)")
-            vol_df = pd.DataFrame({
-                'Symbol': volatility.index, 
-                'Volatility': volatility.values * 100
-            })
-            vol_df['Volatility'] = vol_df['Volatility'].round(2).astype(str) + '%'
-            st.dataframe(vol_df)
-    
-            # Optimize strategy
-            st.write("Optimizing strategy...")
-            progress_bar = st.progress(0)
-    
-            best_params, best_fitness = optimize_strategy(
-                processed_data,
-                correlation_matrix,
-                population_size,
-                generations,
-                mutation_rate,
-                risk_params
+            results, trade_log, equity_curve = backtest_strategy.backtest_event_driven(
+                ibkr_client_instance=client, symbols_contracts=contracts_to_backtest,
+                start_date_str=start_date.strftime('%Y-%m-%d'), end_date_str=end_date.strftime('%Y-%m-%d'),
+                bar_size=bar_size, initial_capital=initial_capital, correlation_matrix_df=None
             )
-    
-            # Store results in session state
-            st.session_state.best_params = best_params
-    
-            # Create strategy with best parameters
-            strategy = TradingStrategy(
-                best_params,
-                transaction_cost=risk_params['transaction_cost'],
-                slippage=risk_params['slippage'],
-                risk_per_trade=risk_params['risk_per_trade'],
-                max_position_size=risk_params['max_position_size'],
-                stop_loss_pct=risk_params['stop_loss'],
-                take_profit_pct=risk_params['take_profit'],
-                volatility_scaling=risk_params['vol_scaling']
-            )
-            
-            # Run backtest with realistic conditions
-            performance = strategy.backtest_portfolio(
-                processed_data, 
-                correlation_matrix,
-                initial_capital=risk_params['initial_capital']
-            )
-            
-            st.session_state.best_performance = performance
-            st.session_state.live_strategy = strategy
-    
-            # Display results
-            st.success("Optimization completed!")
-    
-            # Strategy & Risk Management
-            st.subheader("Strategy Configuration")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Alpha Formula Parameters**")
-                st.markdown("""
-                ```
-                Alpha = w1 * (Short MA - Long MA)/Long MA 
-                      + w2 * (30 - RSI)/30 
-                      + w3 * (RSI - 70)/30 
-                      + w4 * correlation_signal
-                      + 0.2 * MACD signal
-                      + 0.15 * breakout signal
-                ```
-                
-                **Where:**
-                - w1 = {:.2f} (MA signal weight)
-                - w2 = {:.2f} (RSI oversold weight)
-                - w3 = {:.2f} (RSI overbought weight)
-                - w4 = {:.2f} (Correlation weight)
-                - Short MA window = {}
-                - Long MA window = {}
-                """.format(
-                    best_params[2],
-                    best_params[3],
-                    best_params[4],
-                    best_params[5],
-                    int(best_params[0]),
-                    int(best_params[1])
-                ))
-            
-            with col2:
-                st.write("**Risk Management Parameters**")
-                st.markdown(format_position_sizing_params(risk_params))
-    
-            # Performance metrics
-            st.subheader("Portfolio Performance Results")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Starting Capital", f"${risk_params['initial_capital']:,.2f}")
-                st.metric("Final Capital", f"${performance['final_capital']:,.2f}")
-                st.metric("Total Return", f"{performance['total_return']:.2%}")
-                
-            with col2:
-                st.metric("Annual Return", f"{performance['annual_return']:.2%}")
-                st.metric("Sharpe Ratio", f"{performance['sharpe_ratio']:.2f}")
-                st.metric("Max Drawdown", f"{performance['max_drawdown']:.2%}")
-                
-            with col3:
-                st.metric("Win Rate", f"{performance['win_rate']:.2%}")
-                st.metric("Profit Factor", f"{performance['profit_factor']:.2f}")
-                st.metric("Avg Exposure", f"{performance['avg_exposure']:.2%}")
-    
-            # Equity curve
-            st.subheader("Equity Curve")
-            equity_curve = performance['equity_curve']
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=equity_curve.index, 
-                y=equity_curve.values,
-                mode='lines',
-                name='Portfolio Value'
-            ))
-            
-            fig.update_layout(
-                title='Equity Curve',
-                xaxis_title='Date',
-                yaxis_title='Portfolio Value ($)',
-                height=500
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-    
-            # Trade Log
-            st.subheader("Trade Log")
-            trade_log = pd.DataFrame(performance['trade_log'])
-            if not trade_log.empty:
-                trade_log['date'] = pd.to_datetime(trade_log['date'])
-                
-                # Format the trade log for display
-                display_log = trade_log.copy()
-                display_log['price'] = display_log['price'].round(2)
-                display_log['size'] = display_log['size'].round(2)
-                display_log['cost'] = display_log['cost'].round(2)
-                display_log['alpha_value'] = display_log['alpha_value'].round(4)
-                
-                # Add profit/loss column if we have the necessary data
-                if 'stop_price' in display_log.columns:
-                    # Filter to only completed trades
-                    closed_trades = display_log[display_log['action'].isin(['TAKE_PROFIT', 'STOP_LOSS', 'CLOSE'])]
-                    
-                    # Display most recent trades first
-                    closed_trades = closed_trades.sort_values('date', ascending=False)
-                    
-                    st.dataframe(closed_trades.head(20))
-                else:
-                    st.dataframe(display_log.head(20))
-    
-                # Export option
-                csv = display_log.to_csv()
-                st.download_button(
-                    label="Download Complete Trade Log",
-                    data=csv,
-                    file_name="trade_log_portfolio.csv",
-                    mime='text/csv',
-                )
-    
-            # Performance charts
-            st.subheader("Detailed Performance Analysis")
-            fig = PerformanceAnalyzer.create_performance_charts(
-                performance['returns'],
-                performance['drawdowns']
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
+            st.session_state.backtest_results = results
+            st.session_state.backtest_trade_log = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
+            st.session_state.backtest_equity_curve = equity_curve if equity_curve is not None else pd.DataFrame()
+            st.success("Backtest completed!")
+            logger.info("Backtest completed successfully.")
         except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-    
-    # Display saved results if available
-    elif st.session_state.best_params is not None:
-        st.subheader("Previous Optimization Results")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("**Alpha Formula Parameters**")
-            st.markdown("""
-            ```
-            Alpha Formula Parameters:
-            - Short MA window = {}
-            - Long MA window = {}
-            - MA signal weight = {:.2f}
-            - RSI oversold weight = {:.2f}
-            - RSI overbought weight = {:.2f}
-            - Correlation weight = {:.2f}
-            ```
-            """.format(
-                int(st.session_state.best_params[0]),
-                int(st.session_state.best_params[1]),
-                st.session_state.best_params[2],
-                st.session_state.best_params[3],
-                st.session_state.best_params[4],
-                st.session_state.best_params[5]
-            ))
-        
-        if st.session_state.best_performance is not None:
-            # Performance metrics
-            metrics = PerformanceAnalyzer.calculate_metrics(
-                st.session_state.best_performance['returns']
-            )
-    
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Return", f"{metrics['total_return']:.2%}")
-            col2.metric("Annual Return", f"{metrics['annual_return']:.2%}")
-            col3.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-            col4.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-    
-            # Equity curve if available
-            if 'equity_curve' in st.session_state.best_performance:
-                st.subheader("Equity Curve")
-                equity_curve = st.session_state.best_performance['equity_curve']
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=equity_curve.index, 
-                    y=equity_curve.values,
-                    mode='lines',
-                    name='Portfolio Value'
-                ))
-                
-                fig.update_layout(
-                    title='Equity Curve',
-                    xaxis_title='Date',
-                    yaxis_title='Portfolio Value ($)',
-                    height=500
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                # Legacy chart
-                fig = PerformanceAnalyzer.create_performance_charts(
-                    metrics['returns'],
-                    metrics['drawdowns']
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            st.error(f"Backtest failed: {str(e)}")
+            logger.error(f"Backtest execution error: {e}", exc_info=True)
+            st.session_state.backtest_results = None
+            st.session_state.backtest_trade_log = pd.DataFrame()
+            st.session_state.backtest_equity_curve = pd.DataFrame()
 
-with tab2:
-    st.header("Live Trading Simulator")
-    
-    # Check if strategy is available
-    if st.session_state.live_strategy is None:
-        st.warning("Please optimize a strategy first in the Strategy Optimization tab")
-    else:
-        # Portfolio setup
-        st.subheader("Current Portfolio")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            # Allow user to set initial capital if not already trading
-            if not st.session_state.live_trading:
-                initial_capital = st.number_input(
-                    "Initial Capital ($)", 
-                    min_value=10000, 
-                    value=100000, 
-                    step=10000
-                )
-                st.session_state.portfolio_value = initial_capital
-                
-                # Initialize positions with symbols from optimization
-                if len(st.session_state.positions) == 0 and st.session_state.best_performance is not None:
-                    trade_log = pd.DataFrame(st.session_state.best_performance['trade_log'])
-                    if not trade_log.empty:
-                        symbols = trade_log['symbol'].unique()
-                        for symbol in symbols:
-                            st.session_state.positions[symbol] = {
-                                'size': 0,
-                                'cost_basis': 0,
-                                'market_value': 0
-                            }
-            else:
-                st.metric("Portfolio Value", f"${st.session_state.portfolio_value:,.2f}")
-        
-        with col2:
-            if st.session_state.last_update:
-                st.write(f"Last Update: {st.session_state.last_update}")
-            
-            if st.session_state.live_trading:
-                if st.button("Stop Live Trading"):
-                    st.session_state.live_trading = False
-                    st.experimental_rerun()
-            else:
-                if st.button("Start Live Trading"):
-                    # Initialize live trading
-                    st.session_state.live_trading = True
-                    st.session_state.live_strategy.start_live_trading(st.session_state.portfolio_value)
-                    st.experimental_rerun()
-        
-        with col3:
-            if st.session_state.live_trading:
-                if st.button("Update Signals"):
-                    simulate_live_trading()
-                    st.experimental_rerun()
-        
-        # Display current positions
-        if len(st.session_state.positions) > 0:
-            positions_df = []
-            for symbol, position in st.session_state.positions.items():
-                positions_df.append({
-                    'Symbol': symbol,
-                    'Size': position.get('size', 0),
-                    'Cost Basis': position.get('cost_basis', 0),
-                    'Market Value': position.get('market_value', 0),
-                    'Profit/Loss': position.get('pnl', 0) if 'pnl' in position else 0
-                })
-            
-            positions_df = pd.DataFrame(positions_df)
-            st.dataframe(positions_df)
-        
-        # Live trading signals
-        if st.session_state.live_trading and st.session_state.live_signals:
-            st.subheader("Current Trading Signals")
-            
-            signals_df = []
-            for symbol, signal in st.session_state.live_signals.items():
-                signals_df.append({
-                    'Symbol': symbol,
-                    'Action': signal.get('action', ''),
-                    'Signal': signal.get('signal', 0),
-                    'Alpha': signal.get('alpha', 0),
-                    'Price': signal.get('price', 0),
-                    'Size': signal.get('size', 0) if 'size' in signal else 0,
-                    'Stop Price': signal.get('stop_price', 0) if 'stop_price' in signal else 0,
-                    'Take Profit': signal.get('take_profit', 0) if 'take_profit' in signal else 0
-                })
-            
-            signals_df = pd.DataFrame(signals_df)
-            st.dataframe(signals_df)
-            
-            # Visualize signals if any new ones
-            buy_signals = signals_df[signals_df['Action'].isin(['BUY', 'ENTER'])]
-            sell_signals = signals_df[signals_df['Action'].isin(['SELL', 'CLOSE', 'STOP_LOSS', 'TAKE_PROFIT'])]
-            
-            if not buy_signals.empty or not sell_signals.empty:
-                st.subheader("Signal Visualization")
-                
-                # Fetch chart data for visualization
-                if not buy_signals.empty:
-                    symbol = buy_signals.iloc[0]['Symbol']
-                elif not sell_signals.empty:
-                    symbol = sell_signals.iloc[0]['Symbol']
-                else:
-                    symbol = None
-                
-                if symbol:
-                    try:
-                        data, _, _, _ = fetch_latest_data([symbol], lookback_days=30)
-                        prices = data[symbol]['Close']
-                        
-                        fig = go.Figure()
-                        
-                        # Price chart
-                        fig.add_trace(go.Scatter(
-                            x=prices.index,
-                            y=prices.values,
-                            mode='lines',
-                            name='Price'
-                        ))
-                        
-                        # Add buy signals
-                        if not buy_signals.empty:
-                            buy_signal = buy_signals[buy_signals['Symbol'] == symbol]
-                            if not buy_signal.empty:
-                                price = buy_signal.iloc[0]['Price']
-                                stop = buy_signal.iloc[0]['Stop Price']
-                                take_profit = buy_signal.iloc[0]['Take Profit']
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=[prices.index[-1]],
-                                    y=[price],
-                                    mode='markers',
-                                    marker=dict(color='green', size=10),
-                                    name='Buy Signal'
-                                ))
-                                
-                                if stop > 0:
-                                    fig.add_trace(go.Scatter(
-                                        x=[prices.index[-1]],
-                                        y=[stop],
-                                        mode='markers',
-                                        marker=dict(color='red', size=8),
-                                        name='Stop Loss'
-                                    ))
-                                
-                                if take_profit > 0:
-                                    fig.add_trace(go.Scatter(
-                                        x=[prices.index[-1]],
-                                        y=[take_profit],
-                                        mode='markers',
-                                        marker=dict(color='blue', size=8),
-                                        name='Take Profit'
-                                    ))
-                        
-                        # Add sell signals
-                        if not sell_signals.empty:
-                            sell_signal = sell_signals[sell_signals['Symbol'] == symbol]
-                            if not sell_signal.empty:
-                                price = sell_signal.iloc[0]['Price']
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=[prices.index[-1]],
-                                    y=[price],
-                                    mode='markers',
-                                    marker=dict(color='red', size=10),
-                                    name='Sell Signal'
-                                ))
-                        
-                        fig.update_layout(
-                            title=f'{symbol} Price Chart with Signals',
-                            xaxis_title='Date',
-                            yaxis_title='Price',
-                            height=500
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Error visualizing chart: {str(e)}")
-        
-        # If not live trading, show instructions
-        if not st.session_state.live_trading:
-            st.info("""
-            **Live Trading Simulator Instructions**
-            
-            1. Optimize a strategy in the Strategy Optimization tab
-            2. Set your initial capital
-            3. Click "Start Live Trading" to begin the simulation
-            4. Use "Update Signals" to generate new trading signals
-            
-            The simulator will use the optimized strategy to generate realistic trading signals based on current market data.
-            """)
-        
-        # Strategy parameters display
-        if st.session_state.best_params is not None:
-            with st.expander("Current Strategy Parameters"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write("**Alpha Formula Parameters**")
-                    st.markdown("""
-                    ```
-                    - Short MA window = {}
-                    - Long MA window = {}
-                    - MA signal weight = {:.2f}
-                    - RSI oversold weight = {:.2f}
-                    - RSI overbought weight = {:.2f}
-                    - Correlation weight = {:.2f}
-                    ```
-                    """.format(
-                        int(st.session_state.best_params[0]),
-                        int(st.session_state.best_params[1]),
-                        st.session_state.best_params[2],
-                        st.session_state.best_params[3],
-                        st.session_state.best_params[4],
-                        st.session_state.best_params[5]
-                    ))
-                
-                with col2:
-                    st.write("**Risk Management Parameters**")
-                    
-                    # Extract risk params from the live strategy
-                    if st.session_state.live_strategy:
-                        risk_params = {
-                            'initial_capital': st.session_state.portfolio_value,
-                            'risk_per_trade': st.session_state.live_strategy.risk_per_trade,
-                            'max_position_size': st.session_state.live_strategy.max_position_size,
-                            'stop_loss': st.session_state.live_strategy.stop_loss_pct,
-                            'take_profit': st.session_state.live_strategy.take_profit_pct,
-                            'transaction_cost': st.session_state.live_strategy.transaction_cost,
-                            'slippage': st.session_state.live_strategy.slippage,
-                            'vol_scaling': st.session_state.live_strategy.volatility_scaling
-                        }
-                        
-                        st.markdown(format_position_sizing_params(risk_params))
+# --- Streamlit UI Layout ---
+st.set_page_config(layout="wide", page_title="IBKR Trading Bot")
+st.title("IBKR Event-Driven Trading & Backtesting")
 
-with tab3:
-    st.header("Market Analysis")
+# Setup log display area (sidebar)
+log_text_area_key = "app_logs_display_key" # Unique key for the text_area
+log_handler = StreamlitLogHandler(log_text_area_key)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_handler.setFormatter(formatter)
+if not any(isinstance(h, StreamlitLogHandler) for h in logger.handlers):
+    logger.addHandler(log_handler)
+
+st.sidebar.header("IBKR Connection")
+st.sidebar.text_input("Host", value=config.IBKR_HOST, key='ibkr_host_input')
+st.sidebar.number_input("Port", value=config.IBKR_PORT, key='ibkr_port_input', min_value=1, max_value=65535, format="%d")
+st.sidebar.number_input("Client ID", value=config.IBKR_CLIENT_ID, key='ibkr_client_id_input', min_value=0, format="%d")
+
+col_conn1, col_conn2 = st.sidebar.columns(2)
+col_conn1.button("Connect", on_click=handle_connect, use_container_width=True)
+col_conn2.button("Disconnect", on_click=handle_disconnect, use_container_width=True)
+
+client_status = st.session_state.ibkr_client
+if client_status and client_status.ib.isConnected():
+    st.sidebar.success(f"Status: Connected ({client_status.host}:{client_status.port}, ID:{client_status.clientId})")
+else:
+    st.sidebar.error("Status: Disconnected")
+
+st.sidebar.header("Logs")
+st.sidebar.text_area("App Logs", value="\n".join(st.session_state.get(log_text_area_key, [])), height=200, key="log_display_final_area", disabled=True)
+
+
+# --- Main Content Tabs ---
+tab_live, tab_backtest = st.tabs(["Live Paper Trading (IBKR)", "Event-Driven Backtesting (IBKR)"])
+
+with tab_live:
+    st.header("Live Paper Trading Controls")
+    if not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()):
+        st.warning("Connect to IBKR to enable live trading.")
     
-    # Stock selection for analysis
-    st.sidebar.header("Market Analysis")
-    analysis_symbols = st.sidebar.text_input(
-        "Enter symbols for analysis (comma separated)",
-        value="AAPL,MSFT,GOOGL,AMZN,SPY"
-    ).split(',')
+    st.text_input("Symbols (comma-separated, e.g., AAPL,EURUSD)", value="AAPL,TSLA", key='live_symbols_input', disabled=st.session_state.live_trading_active)
+    st.number_input("Initial Capital", value=100000.0, key='live_initial_capital_input', format="%.2f", disabled=st.session_state.live_trading_active)
     
-    analysis_period = st.sidebar.selectbox(
-        "Analysis Period",
-        ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"],
-        index=2
-    )
-    
-    # Convert period to days
-    period_dict = {
-        "1 Week": 7,
-        "1 Month": 30,
-        "3 Months": 90,
-        "6 Months": 180,
-        "1 Year": 365
-    }
-    analysis_days = period_dict[analysis_period]
-    
-    # Analysis tools
-    analysis_options = st.multiselect(
-        "Select Analysis Tools",
-        ["Price Charts", "Correlation Analysis", "Volatility Analysis", "Return Distribution"],
-        default=["Price Charts", "Correlation Analysis"]
-    )
-    
-    if st.button("Run Analysis"):
-        try:
-            with st.spinner("Fetching market data..."):
-                # Fetch data for analysis
-                data_dict, correlation_matrix, volatility, returns = fetch_latest_data(
-                    analysis_symbols, 
-                    lookback_days=analysis_days
-                )
-            
-            if "Price Charts" in analysis_options:
-                st.subheader("Price Charts")
-                
-                # Normalize prices for comparison
-                normalized_prices = pd.DataFrame()
-                
-                for symbol, data in data_dict.items():
-                    prices = data['Close']
-                    normalized_prices[symbol] = prices / prices.iloc[0]
-                
-                # Plot normalized prices
-                fig = go.Figure()
-                
-                for symbol in normalized_prices.columns:
-                    fig.add_trace(go.Scatter(
-                        x=normalized_prices.index,
-                        y=normalized_prices[symbol],
-                        mode='lines',
-                        name=symbol
-                    ))
-                
-                fig.update_layout(
-                    title='Normalized Price Comparison',
-                    xaxis_title='Date',
-                    yaxis_title='Normalized Price (Start=1)',
-                    height=500
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Individual price charts
-                col1, col2 = st.columns(2)
-                
-                for i, symbol in enumerate(data_dict.keys()):
-                    # Alternate between columns
-                    with col1 if i % 2 == 0 else col2:
-                        prices = data_dict[symbol]['Close']
-                        
-                        # Calculate moving averages
-                        ma20 = prices.rolling(window=20).mean()
-                        ma50 = prices.rolling(window=50).mean()
-                        
-                        # Create chart
-                        fig = go.Figure()
-                        
-                        fig.add_trace(go.Scatter(
-                            x=prices.index,
-                            y=prices.values,
-                            mode='lines',
-                            name='Price'
-                        ))
-                        
-                        fig.add_trace(go.Scatter(
-                            x=ma20.index,
-                            y=ma20.values,
-                            mode='lines',
-                            name='20-day MA',
-                            line=dict(color='orange')
-                        ))
-                        
-                        fig.add_trace(go.Scatter(
-                            x=ma50.index,
-                            y=ma50.values,
-                            mode='lines',
-                            name='50-day MA',
-                            line=dict(color='green')
-                        ))
-                        
-                        fig.update_layout(
-                            title=f'{symbol} Price Chart',
-                            xaxis_title='Date',
-                            yaxis_title='Price',
-                            height=400
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-            
-            if "Correlation Analysis" in analysis_options:
-                st.subheader("Correlation Analysis")
-                
-                # Correlation heatmap
-                fig_corr = plot_correlation_matrix(correlation_matrix)
-                st.plotly_chart(fig_corr, use_container_width=True)
-                
-                # Correlation statistics
-                st.write("**Correlation Statistics**")
-                
-                # Average correlation for each asset
-                avg_correlations = correlation_matrix.mean().sort_values()
-                
-                # Format as dataframe
-                corr_df = pd.DataFrame({
-                    'Symbol': avg_correlations.index,
-                    'Avg Correlation': avg_correlations.values
-                })
-                
-                # Format correlation values
-                corr_df['Avg Correlation'] = corr_df['Avg Correlation'].round(3)
-                
-                # Color-code correlations
-                def color_correlation(val):
-                    if val < 0.3:
-                        return 'background-color: green; color: white'
-                    elif val > 0.7:
-                        return 'background-color: red; color: white'
-                    else:
-                        return ''
-                
-                st.dataframe(corr_df.style.applymap(
-                    color_correlation, subset=['Avg Correlation']
-                ))
-            
-            if "Volatility Analysis" in analysis_options:
-                st.subheader("Volatility Analysis")
-                
-                # Format volatility data
-                vol_df = pd.DataFrame({
-                    'Symbol': volatility.index,
-                    'Annualized Volatility': volatility.values * 100
-                })
-                
-                vol_df = vol_df.sort_values('Annualized Volatility')
-                
-                # Create bar chart of volatilities
-                fig = px.bar(
-                    vol_df,
-                    x='Symbol',
-                    y='Annualized Volatility',
-                    title='Annualized Volatility (%)',
-                    labels={'Annualized Volatility': 'Volatility (%)'},
-                    color='Annualized Volatility',
-                    color_continuous_scale='Viridis'
-                )
-                
-                fig.update_layout(height=400)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Volatility over time
-                st.write("**Volatility Over Time**")
-                
-                # Calculate rolling volatility
-                rolling_vol = pd.DataFrame()
-                
-                for symbol, data in data_dict.items():
-                    rolling_vol[symbol] = data['Close'].pct_change().rolling(window=20).std() * np.sqrt(252) * 100
-                
-                # Plot rolling volatility
-                fig = go.Figure()
-                
-                for symbol in rolling_vol.columns:
-                    fig.add_trace(go.Scatter(
-                        x=rolling_vol.index,
-                        y=rolling_vol[symbol],
-                        mode='lines',
-                        name=symbol
-                    ))
-                
-                fig.update_layout(
-                    title='20-Day Rolling Volatility',
-                    xaxis_title='Date',
-                    yaxis_title='Annualized Volatility (%)',
-                    height=500
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            if "Return Distribution" in analysis_options:
-                st.subheader("Return Distribution Analysis")
-                
-                # Calculate daily returns
-                daily_returns = pd.DataFrame()
-                
-                for symbol, data in data_dict.items():
-                    daily_returns[symbol] = data['Close'].pct_change().dropna()
-                
-                # Plot return distribution
-                fig = go.Figure()
-                
-                for symbol in daily_returns.columns:
-                    fig.add_trace(go.Histogram(
-                        x=daily_returns[symbol] * 100,
-                        name=symbol,
-                        opacity=0.7,
-                        nbinsx=50
-                    ))
-                
-                fig.update_layout(
-                    title='Daily Return Distribution',
-                    xaxis_title='Daily Return (%)',
-                    yaxis_title='Frequency',
-                    barmode='overlay',
-                    height=500
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Return statistics
-                st.write("**Return Statistics**")
-                
-                stats_df = pd.DataFrame(index=daily_returns.columns)
-                stats_df['Mean Return (%)'] = daily_returns.mean() * 100
-                stats_df['Std Dev (%)'] = daily_returns.std() * 100
-                stats_df['Min (%)'] = daily_returns.min() * 100
-                stats_df['Max (%)'] = daily_returns.max() * 100
-                stats_df['Skewness'] = daily_returns.skew()
-                stats_df['Kurtosis'] = daily_returns.kurtosis()
-                
-                # Round values
-                stats_df = stats_df.round(3)
-                
-                # Reset index
-                stats_df = stats_df.reset_index()
-                stats_df = stats_df.rename(columns={'index': 'Symbol'})
-                
-                st.dataframe(stats_df)
-        
-        except Exception as e:
-            st.error(f"Error in market analysis: {str(e)}")
+    st.subheader("Alpha Parameters (Live)")
+    col_alpha_live1, col_alpha_live2 = st.columns(2)
+    col_alpha_live1.number_input("Short MA", value=10, key='live_alpha_short_ma', min_value=1, disabled=st.session_state.live_trading_active)
+    col_alpha_live1.number_input("Long MA", value=20, key='live_alpha_long_ma', min_value=2, disabled=st.session_state.live_trading_active)
+    col_alpha_live2.number_input("MA Weight", value=0.6, key='live_alpha_ma_weight', format="%.2f", disabled=st.session_state.live_trading_active)
+    col_alpha_live2.number_input("RSI OS Weight", value=0.25, key='live_alpha_rsi_os_weight', format="%.2f", disabled=st.session_state.live_trading_active)
+    col_alpha_live1.number_input("RSI OB Weight", value=-0.25, key='live_alpha_rsi_ob_weight', format="%.2f", disabled=st.session_state.live_trading_active)
+    col_alpha_live1.number_input("Corr Weight", value=0.15, key='live_alpha_corr_weight', format="%.2f", disabled=st.session_state.live_trading_active)
+
+
+    col_trade1, col_trade2 = st.columns(2)
+    col_trade1.button("Start Live Trading", on_click=handle_start_trading, 
+                      disabled=not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()) or st.session_state.live_trading_active, 
+                      use_container_width=True)
+    col_trade2.button("Stop Live Trading", on_click=handle_stop_trading, 
+                      disabled=not st.session_state.live_trading_active, 
+                      use_container_width=True)
+
+    if st.session_state.live_trading_active:
+        st.info(f"Live trading is ON for: {', '.join(st.session_state.subscribed_contracts.keys())}")
     else:
-        st.info("""
-        **Market Analysis Tools**
+        st.info("Live trading is OFF.")
+
+    st.subheader("Live Strategy State")
+    strategy_instance = st.session_state.get('trading_strategy')
+    if strategy_instance: # Display even if not active, to see last state
+        st.metric("Strategy Capital", f"${strategy_instance.live_capital:,.2f}")
         
-        Select one or more analysis tools and click "Run Analysis" to:
-        
-        - View price charts with moving averages
-        - Analyze correlations between assets
-        - Examine volatility patterns
-        - Analyze return distributions
-        
-        This information can help you understand market conditions and refine your trading strategy.
-        """)
-        
-# Auto-update live trading (if active)
-if st.session_state.live_trading:
-    # Only update if it's been more than 60 seconds since last update
-    if (st.session_state.last_update is None or
-        (datetime.now() - datetime.strptime(st.session_state.last_update, '%Y-%m-%d %H:%M:%S')).total_seconds() > 60):
-        simulate_live_trading()
+        st.subheader("Current Positions (Strategy View)")
+        if strategy_instance.live_positions:
+            st.dataframe(pd.DataFrame.from_dict(strategy_instance.live_positions, orient='index'))
+        else:
+            st.write("No active positions in strategy.")
+
+        st.subheader("Trade Log (Current Live Session)")
+        if strategy_instance.trade_log:
+            st.dataframe(pd.DataFrame(strategy_instance.trade_log).tail(10)) # Show last 10
+        else:
+            st.write("No trades yet in this session.")
+    else:
+        st.write("Trading strategy not initialized yet.")
+
+
+with tab_backtest:
+    st.header("Event-Driven Backtest Configuration")
+    if not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()):
+        st.warning("Connect to IBKR to enable backtesting data fetching.")
+
+    st.text_input("Symbols (comma-separated)", value="AAPL,MSFT", key='backtest_symbols_input')
+    d_col1, d_col2 = st.columns(2)
+    d_col1.date_input("Start Date", value=datetime.now() - timedelta(days=90), key='backtest_start_date_input')
+    d_col2.date_input("End Date", value=datetime.now() - timedelta(days=1), key='backtest_end_date_input')
+    
+    st.selectbox("Bar Size", 
+                 options=["1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min", "2 mins", "3 mins", "5 mins", "10 mins", "15 mins", "20 mins", "30 mins", "1 hour", "2 hours", "3 hours", "4 hours", "8 hours", "1 day", "1 week", "1 month"], 
+                 index=13, key='backtest_bar_size_input') # Default to 1 hour
+    st.number_input("Initial Capital (Backtest)", value=100000.0, key='backtest_initial_capital_input', format="%.2f")
+
+    st.subheader("Alpha Parameters (Backtest)")
+    col_alpha_bt1, col_alpha_bt2 = st.columns(2)
+    col_alpha_bt1.number_input("Short MA", value=10, key='bt_alpha_short_ma', min_value=1)
+    col_alpha_bt1.number_input("Long MA", value=20, key='bt_alpha_long_ma', min_value=2)
+    col_alpha_bt2.number_input("MA Weight", value=0.6, key='bt_alpha_ma_weight', format="%.2f")
+    col_alpha_bt2.number_input("RSI OS Weight", value=0.25, key='bt_alpha_rsi_os_weight', format="%.2f")
+    col_alpha_bt1.number_input("RSI OB Weight", value=-0.25, key='bt_alpha_rsi_ob_weight', format="%.2f")
+    col_alpha_bt1.number_input("Corr Weight", value=0.15, key='bt_alpha_corr_weight', format="%.2f")
+
+
+    st.button("Run Backtest", on_click=handle_run_backtest, 
+              disabled=not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()))
+
+    if st.session_state.backtest_results:
+        st.subheader("Backtest Performance Metrics")
+        results = st.session_state.backtest_results
+        if results and "error" not in results:
+            col_bt_m1, col_bt_m2, col_bt_m3 = st.columns(3)
+            col_bt_m1.metric("Initial Capital", f"${results.get('initial_capital', 0):,.2f}")
+            col_bt_m1.metric("Final Capital", f"${results.get('final_capital', 0):,.2f}")
+            col_bt_m2.metric("Total Return", f"{results.get('total_return', 0):.2%}")
+            col_bt_m2.metric("Sharpe Ratio", f"${results.get('sharpe_ratio', 0):.2f}")
+            col_bt_m3.metric("Max Drawdown", f"{results.get('max_drawdown', 0):.2%}")
+            col_bt_m3.metric("Number of Trades", f"{results.get('num_trades', 0)}")
+            
+            st.subheader("Equity Curve (Backtest)")
+            if not st.session_state.backtest_equity_curve.empty:
+                st.line_chart(st.session_state.backtest_equity_curve['capital'])
+            else: st.write("Equity curve data not available.")
+
+            st.subheader("Trade Log (Backtest)")
+            if not st.session_state.backtest_trade_log.empty:
+                st.dataframe(st.session_state.backtest_trade_log)
+            else: st.write("No trades in this backtest.")
+        elif results and "error" in results:
+             st.error(f"Backtest Error: {results['error']}")
+
+
+logger.info("Streamlit app script execution finished. UI rendered.")
