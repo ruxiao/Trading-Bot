@@ -59,12 +59,28 @@ if __name__ == '__main__':
     # Print out the analysis results
     strat = results[0] # Get the first strategy
     print('\n--- Analyzers ---')
-    print(f"Sharpe Ratio: {strat.analyzers.sharpe_ratio.get_analysis()['sharperatio']:.2f}")
+    sharpe_ratio_analysis = strat.analyzers.sharpe_ratio.get_analysis()
+    sharpe_ratio = sharpe_ratio_analysis.get('sharperatio', None)
+    if sharpe_ratio is not None:
+        print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+    else:
+        print("Sharpe Ratio: N/A (not enough data or trades)")
+
     # AnnualReturn is a dictionary of year:return_rate
+    annual_return_analysis = strat.analyzers.annual_return.get_analysis()
     print("Annual Return:")
-    for year, ret in strat.analyzers.annual_return.get_analysis().items():
-        print(f"  {year}: {ret*100:.2f}%")
-    print(f"Max Drawdown: {strat.analyzers.drawdown.get_analysis()['max']['drawdown']:.2f}%")
+    if annual_return_analysis:
+        for year, ret in annual_return_analysis.items():
+            print(f"  {year}: {ret*100:.2f}%")
+    else:
+        print("  N/A (not enough data or trades)")
+
+    drawdown_analysis = strat.analyzers.drawdown.get_analysis()
+    max_drawdown = drawdown_analysis.get('max', {}).get('drawdown', None)
+    if max_drawdown is not None:
+        print(f"Max Drawdown: {max_drawdown:.2f}%")
+    else:
+        print("Max Drawdown: N/A (not enough data or trades)")
 
     trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
     if trade_analysis:
