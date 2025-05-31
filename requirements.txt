@@ -3,3 +3,4 @@ pandas>=2.2.0
 pytest
 pytest-mock
 backtrader>=1.9.76
+yfinance>=0.2.30
