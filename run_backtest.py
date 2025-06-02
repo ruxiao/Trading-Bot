@@ -2,19 +2,23 @@ import backtrader as bt
 import datetime
 import yfinance as yf
 import argparse
-import pandas as pd # Ensure pandas is imported
-from backtrader_strategies import EMA20Strategy, MACrossoverStrategy, RSIStrategy, EMACrossoverWithSentimentFilter
+import numpy as np # Added
+import pandas as pd # Added
+
+from backtrader_strategies import EMA20Strategy, MACrossoverStrategy, RSIStrategy, EMACrossoverWithSentimentFilter, AlternativeDataStrategy # Added AlternativeDataStrategy
+from alternative_data_feed import AlternativeDataFeed # Added
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Backtest trading strategies.')
     parser.add_argument('--ticker', type=str, default='TSLA', help='Stock ticker symbol (e.g., TSLA, META)')
     parser.add_argument('--fromdate', type=str, default=None, help='Start date for backtesting (YYYY-MM-DD). Defaults to 1 year ago.')
     parser.add_argument('--todate', type=str, default=None, help='End date for backtesting (YYYY-MM-DD). Defaults to today.')
-    parser.add_argument('--strategy', type=str, default='EMA20', choices=['EMA20', 'MACrossover', 'RSI', 'EMASentiment'], help='Strategy to use')
+    parser.add_argument('--strategy', type=str, default='EMA20',
+                        choices=['EMA20', 'MACrossover', 'RSI', 'EMASentiment', 'AlternativeData'], # Added AlternativeData
+                        help='Strategy to use')
 
     args = parser.parse_args()
 
-    # Determine date range
     to_date = datetime.datetime.now() if args.todate is None else datetime.datetime.strptime(args.todate, '%Y-%m-%d')
     from_date = (to_date - datetime.timedelta(days=365)) if args.fromdate is None else datetime.datetime.strptime(args.fromdate, '%Y-%m-%d')
 
@@ -24,55 +28,37 @@ if __name__ == '__main__':
     print(f"Fetching data for {args.ticker} from {from_date_str} to {to_date_str} for {args.strategy} strategy.")
 
     try:
-        # Using auto_adjust=False to get 'Adj Close' separately
-        data_df_raw = yf.download(args.ticker, start=from_date_str, end=to_date_str, progress=False, auto_adjust=False, actions=False)
-
-        # Select and rename specific columns for backtrader
-        data_df = pd.DataFrame(index=data_df_raw.index)
-        data_df['open'] = data_df_raw['Open']
-        data_df['high'] = data_df_raw['High']
-        data_df['low'] = data_df_raw['Low']
-        data_df['close'] = data_df_raw['Adj Close'] # Use Adj Close for close
-        data_df['volume'] = data_df_raw['Volume']
-
-        # Remove any rows with NaN values that might have been introduced (e.g. if 'Adj Close' had NaNs where 'Close' didn't)
-        data_df.dropna(inplace=True)
-
-        print("--- DataFrame Head ---")
-        print(data_df.head())
-        print("--- DataFrame Info ---")
-        data_df.info()
-        print("--- DataFrame Columns ---")
-        print(data_df.columns)
-
+        # Using auto_adjust=False to get unadjusted prices, which is often preferred for backtesting
+        # as adjustments can be handled by the strategy or broker simulation if needed.
+        # We will need to manually select 'Adj Close' as 'close' or ensure other OHLC are what we want.
+        raw_data_df = yf.download(args.ticker, start=from_date_str, end=to_date_str, progress=False, auto_adjust=False)
     except Exception as e:
-        print(f"Error fetching data or processing DataFrame for ticker {args.ticker}: {e}")
+        print(f"Error fetching data using yfinance for ticker {args.ticker}: {e}")
         exit()
 
-    if data_df.empty:
+    if raw_data_df.empty:
         print(f"No data fetched for {args.ticker}. Check ticker symbol or date range ({from_date_str} to {to_date_str}).")
         exit()
 
+    # Prepare DataFrame for backtrader
+    # Use 'Adj Close' for 'close', and ensure standard OHLCV columns are present and lowercase
+    data_df = pd.DataFrame(index=raw_data_df.index)
+    data_df['open'] = raw_data_df['Open']
+    data_df['high'] = raw_data_df['High']
+    data_df['low'] = raw_data_df['Low']
+    data_df['close'] = raw_data_df['Adj Close'] # Use adjusted close for 'close'
+    data_df['volume'] = raw_data_df['Volume']
+
+    # Remove any rows with NaN values that might have resulted from joins or data issues
+    data_df.dropna(inplace=True)
+
     if data_df.empty:
-        print(f"No data fetched for {args.ticker}. Check ticker symbol or date range ({from_date_str} to {to_date_str}).")
+        print(f"Data for {args.ticker} became empty after NaN drop. Original rows: {len(raw_data_df)}")
         exit()
-
-    # The index is already datetime from yfinance
-    # data_df column names are already lowercase 'open', 'high', 'low', 'close', 'volume'
-
-    # Explicit column mapping for PandasData
-    data_feed = bt.feeds.PandasData(
-        dataname=data_df,
-        datetime=None,  # Use index for datetime
-        open='open',    # These are now the lowercase names in data_df
-        high='high',
-        low='low',
-        close='close',
-        volume='volume',
-        openinterest=None # Explicitly state no open interest
-    )
 
     cerebro = bt.Cerebro()
+
+    use_alternative_data_feed = False # Flag
 
     if args.strategy == 'EMA20':
         cerebro.addstrategy(EMA20Strategy)
@@ -86,16 +72,41 @@ if __name__ == '__main__':
     elif args.strategy == 'EMASentiment':
         cerebro.addstrategy(EMACrossoverWithSentimentFilter)
         print("Using EMACrossoverWithSentimentFilter Strategy")
+    elif args.strategy == 'AlternativeData':
+        use_alternative_data_feed = True
+        cerebro.addstrategy(AlternativeDataStrategy, symbol=args.ticker) # Pass ticker to strategy params
+        print("Using AlternativeData Strategy")
     else:
-        # Should not happen due to 'choices' in argparse, but as a fallback:
         print(f"Unknown strategy: {args.strategy}. Defaulting to EMA20.")
         cerebro.addstrategy(EMA20Strategy)
 
+    # Create and add data feed
+    if use_alternative_data_feed:
+        print("Preparing AlternativeDataFeed...")
+        # Add simulated alternative data columns
+        data_df['dark_pool_ratio'] = np.random.uniform(0.1, 0.25, len(data_df))
+        data_df['volatility_surface'] = np.random.uniform(25, 45, len(data_df))
+        data_df['put_call_ratio'] = np.random.uniform(0.7, 1.5, len(data_df))
+        data_df['iv_skew'] = np.random.uniform(0.9, 1.5, len(data_df))
+        data_df['gamma_exposure'] = np.random.uniform(-0.15, 0.15, len(data_df))
+
+        # Ensure all column names are lowercase (should be already by construction above)
+        data_df.columns = [str(col).lower() for col in data_df.columns]
+
+        print("DataFrame columns for AlternativeDataFeed:", data_df.columns)
+        # print(data_df.head()) # Optional: print head for debugging
+
+        data_feed = AlternativeDataFeed(dataname=data_df)
+    else:
+        # For standard strategies, ensure columns are lowercase if not already
+        data_df.columns = [str(col).lower() for col in data_df.columns]
+        data_feed = bt.feeds.PandasData(dataname=data_df)
+
     cerebro.adddata(data_feed)
     cerebro.broker.setcash(100000.0)
-    cerebro.broker.setcommission(commission=0.001) # 0.1% commission
+    cerebro.broker.setcommission(commission=0.001)
 
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days) # Specify timeframe
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.AnnualReturn, _name='annual_return')
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
@@ -128,51 +139,46 @@ if __name__ == '__main__':
         print("Max Drawdown: N/A")
 
     trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
-
-    # Use .get() for safer access, providing default empty dicts or zero values
-    total_trades = trade_analysis.get('total', {}).get('total', 0)
-    open_trades = trade_analysis.get('total', {}).get('open', 0)
-    closed_trades = trade_analysis.get('total', {}).get('closed', 0)
-
-    print("\n--- Trade Analysis ---")
-    if closed_trades > 0:
-        print(f"Total Trades: {total_trades}")
-        print(f"Total Open Trades: {open_trades}")
-        print(f"Total Closed Trades: {closed_trades}")
+    if trade_analysis and hasattr(trade_analysis, 'total') and trade_analysis.total.closed > 0 :
+        print("\n--- Trade Analysis ---")
+        print(f"Total Trades: {trade_analysis.total.total}")
+        print(f"Total Open Trades: {trade_analysis.total.open}")
+        print(f"Total Closed Trades: {trade_analysis.total.closed}")
         print("-" * 20)
-
-        won_total = trade_analysis.get('won', {}).get('total', 0)
-        win_rate_val = (won_total / closed_trades * 100) if closed_trades > 0 else 0
+        win_rate_val = (trade_analysis.won.total / trade_analysis.total.closed * 100) if trade_analysis.total.closed > 0 else 0
         print(f"Win Rate: {win_rate_val:.2f}%")
 
-        avg_win_pnl = trade_analysis.get('won', {}).get('pnl', {}).get('average', 0)
-        print(f"Average Win $: {avg_win_pnl:.2f}")
+        avg_win_val = trade_analysis.won.pnl.average if trade_analysis.won.total > 0 and hasattr(trade_analysis.won.pnl, 'average') else 0
+        print(f"Average Win $: {avg_win_val:.2f}")
 
-        lost_total = trade_analysis.get('lost', {}).get('total', 0)
-        avg_loss_pnl = trade_analysis.get('lost', {}).get('pnl', {}).get('average', 0)
-        print(f"Average Loss $: {avg_loss_pnl:.2f}")
+        avg_loss_val = trade_analysis.lost.pnl.average if trade_analysis.lost.total > 0 and hasattr(trade_analysis.lost.pnl, 'average') else 0
+        print(f"Average Loss $: {avg_loss_val:.2f}")
 
-        total_won_pnl = trade_analysis.get('won', {}).get('pnl', {}).get('total', 0)
-        total_lost_pnl = trade_analysis.get('lost', {}).get('pnl', {}).get('total', 0)
-
-        profit_factor_val = 0
-        if total_lost_pnl != 0:
-            profit_factor_val = abs(total_won_pnl / total_lost_pnl)
-        elif total_won_pnl > 0: # All wins, no losses
+        profit_factor_val = float('inf')
+        if hasattr(trade_analysis.lost.pnl, 'total') and trade_analysis.lost.pnl.total != 0 and hasattr(trade_analysis.won.pnl, 'total'): # Check if total is not None
+            if trade_analysis.lost.pnl.total != 0: # Ensure denominator is not zero
+                 profit_factor_val = abs(trade_analysis.won.pnl.total / trade_analysis.lost.pnl.total)
+            elif trade_analysis.won.pnl.total > 0 : # All wins, no losses
+                 profit_factor_val = float('inf')
+            else: # No wins and no losses
+                 profit_factor_val = 0
+        elif hasattr(trade_analysis.won.pnl, 'total') and trade_analysis.won.pnl.total > 0: # All wins
              profit_factor_val = float('inf')
+        else: # No wins or no losses
+            profit_factor_val = 0
+
         print(f"Profit Factor: {'inf' if profit_factor_val == float('inf') else f'{profit_factor_val:.2f}'}")
         print("-" * 20)
-
-        longest_win_streak = trade_analysis.get('streak', {}).get('won', {}).get('longest', 0)
+        longest_win_streak = trade_analysis.streak.won.longest if hasattr(trade_analysis.streak.won, 'longest') else 0
         print(f"Longest Winning Streak: {longest_win_streak}")
-
-        longest_loss_streak = trade_analysis.get('streak', {}).get('lost', {}).get('longest', 0)
+        longest_loss_streak = trade_analysis.streak.lost.longest if hasattr(trade_analysis.streak.lost, 'longest') else 0
         print(f"Longest Losing Streak: {longest_loss_streak}")
     else:
-        print("No closed trades to analyze.")
+        print("\n--- Trade Analysis ---")
+        print("No closed trades to analyze or trade_analysis object is not as expected.")
 
     try:
         print("Attempting to plot results...")
-        cerebro.plot(style='candlestick', barup='green', bardown='red')
+        cerebro.plot(style='candlestick', barup='green', bardown='red', volume=False) # volume=False
     except Exception as e:
         print(f"Could not plot results. Error: {e}. Ensure matplotlib and a GUI backend like tkinter are installed and configured.")
