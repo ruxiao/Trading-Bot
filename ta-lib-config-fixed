@@ -1,0 +1,33 @@
+#!/bin/sh
+
+prefix=/usr
+exec_prefix=/usr
+
+usage="\
+Usage: ta-lib-config [--version] [--libs] [--cflags]"
+
+if test $# -eq 0; then
+      echo "${usage}" 1>&2
+      exit 1
+fi
+
+while test $# -gt 0; do
+  case $1 in
+    --version)
+      echo 0.4.0
+      ;;
+    --cflags)
+      # Corrected CFLAGS
+      echo -I${prefix}/include/ta-lib -DHAVE_CONFIG_H
+      ;;
+    --libs)
+      # Corrected LIBS - ensuring -lta-lib is present and paths are correct
+      echo -L${exec_prefix}/lib -lta-lib -lpthread -ldl
+      ;;
+    *)
+      echo "${usage}" 1>&2
+      exit 1
+      ;;
+  esac
+  shift
+done
