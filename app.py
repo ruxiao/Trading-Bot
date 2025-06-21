@@ -5,7 +5,7 @@ from ib_insync import Stock, Forex, Contract # For creating contract objects
 
 # Assuming your custom modules are in the same directory or accessible via PYTHONPATH
 from ibkr_client import IBKRClient
-from trading_strategy import TradingStrategy
+from trading_strategy import TradingStrategy, QQQ0DTEScalping # Import the new strategy
 from performance import PerformanceAnalyzer # For displaying backtest results
 import config # For default connection params
 from datetime import datetime, timedelta
@@ -276,37 +276,76 @@ def handle_run_backtest():
     bar_size = st.session_state.get('backtest_bar_size_input', "1 day")
     initial_capital = st.session_state.get('backtest_initial_capital_input', 100000.0)
     alpha_short_ma_bt = st.session_state.get('bt_alpha_short_ma', 10)
-    alpha_long_ma_bt = st.session_state.get('bt_alpha_long_ma', 20)
+    alpha_long_ma_bt = st.session_state.get('bt_alpha_long_ma', 20) # For generic strategy
+    selected_strategy_name = st.session_state.get('backtest_strategy_select', 'TradingStrategy')
 
-    if not symbols_str:
+    if not symbols_str and selected_strategy_name != 'QQQ0DTEScalping': # QQQ strategy uses fixed symbol
         st.error("Please enter symbols for backtesting."); return
-    symbols_list = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
-    if not symbols_list:
-        st.error("No valid symbols entered for backtesting."); return
+
+    symbols_list = []
+    if selected_strategy_name == 'QQQ0DTEScalping':
+        symbols_list = ["QQQ"] # Hardcode for QQQ strategy
+        st.session_state['backtest_symbols_input'] = "QQQ" # Update UI field
+    else:
+        symbols_list = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+        if not symbols_list:
+            st.error("No valid symbols entered for backtesting."); return
+
     if end_date <= start_date:
         st.error("End date must be after start date."); return
 
     contracts_to_backtest = {}
     for sym_str in symbols_list:
-        contract = get_contract_object(sym_str)
+        contract = get_contract_object(sym_str) # Stock('QQQ', 'SMART', 'USD') for QQQ
         if contract: contracts_to_backtest[sym_str] = contract
         else: st.error(f"Invalid symbol format for backtesting: {sym_str}"); return
     
-    alpha_params_bt = [
-        alpha_short_ma_bt, alpha_long_ma_bt, 
-        st.session_state.get('bt_alpha_ma_weight', 0.6),
-        st.session_state.get('bt_alpha_rsi_os_weight', 0.25),
-        st.session_state.get('bt_alpha_rsi_ob_weight', -0.25),
-        st.session_state.get('bt_alpha_corr_weight', 0.15)
-    ]
-    backtest_strategy = TradingStrategy(alpha_params=alpha_params_bt)
-    
-    with st.spinner(f"Running backtest for {', '.join(symbols_list)}..."):
+    # Strategy Initialization
+    backtest_strategy_instance = None
+    if selected_strategy_name == 'QQQ0DTEScalping':
+        logger.info("Initializing QQQ0DTEScalping strategy for backtest.")
+        backtest_strategy_instance = QQQ0DTEScalping(
+            vwap_period=st.session_state.get('bt_qqq_vwap_period', 20),
+            short_ema_period=st.session_state.get('bt_qqq_short_ema', 5),
+            long_ema_period=st.session_state.get('bt_qqq_long_ema', 12),
+            rsi_period=st.session_state.get('bt_qqq_rsi_period', 9),
+            rsi_oversold=st.session_state.get('bt_qqq_rsi_os', 30),
+            rsi_overbought=st.session_state.get('bt_qqq_rsi_ob', 70),
+            strike_offset_otm=st.session_state.get('bt_qqq_strike_offset', 0.5),
+            option_stop_loss_pct=st.session_state.get('bt_qqq_opt_sl', 0.10),
+            option_take_profit_pct=st.session_state.get('bt_qqq_opt_tp', 0.20),
+            max_daily_trades=st.session_state.get('bt_qqq_max_daily_trades', 5),
+            option_transaction_cost_per_contract=st.session_state.get('bt_qqq_opt_cost', 0.65),
+            option_slippage_per_contract=st.session_state.get('bt_qqq_opt_slippage', 0.02),
+            max_option_contracts_per_trade=st.session_state.get('bt_qqq_max_opt_contracts', 5),
+            capital_per_option_trade_pct=st.session_state.get('bt_qqq_opt_capital_pct', 0.02)
+        )
+    else: # Default to generic TradingStrategy
+        logger.info("Initializing generic TradingStrategy for backtest.")
+        alpha_params_bt = [
+            alpha_short_ma_bt, alpha_long_ma_bt,
+            st.session_state.get('bt_alpha_ma_weight', 0.6),
+            st.session_state.get('bt_alpha_rsi_os_weight', 0.25),
+            st.session_state.get('bt_alpha_rsi_ob_weight', -0.25),
+            st.session_state.get('bt_alpha_corr_weight', 0.15)
+        ]
+        backtest_strategy_instance = TradingStrategy(alpha_params=alpha_params_bt)
+
+    if not backtest_strategy_instance:
+        st.error("Failed to initialize trading strategy.")
+        return
+
+    spinner_message = f"Running backtest for {selected_strategy_name} on {', '.join(symbols_list)}..."
+    with st.spinner(spinner_message):
         try:
-            results, trade_log, equity_curve = backtest_strategy.backtest_event_driven(
-                ibkr_client_instance=client, symbols_contracts=contracts_to_backtest,
-                start_date_str=start_date.strftime('%Y-%m-%d'), end_date_str=end_date.strftime('%Y-%m-%d'),
-                bar_size=bar_size, initial_capital=initial_capital, correlation_matrix_df=None
+            results, trade_log, equity_curve = backtest_strategy_instance.backtest_event_driven(
+                ibkr_client_instance=client,
+                symbols_contracts=contracts_to_backtest, # For QQQ0DTE, this should be {'QQQ': qqq_contract}
+                start_date_str=start_date.strftime('%Y-%m-%d'),
+                end_date_str=end_date.strftime('%Y-%m-%d'),
+                bar_size=bar_size, # This is for the underlying (QQQ)
+                initial_capital=initial_capital
+                # correlation_matrix_df is not used by QQQ0DTEScalping
             )
             st.session_state.backtest_results = results
             st.session_state.backtest_trade_log = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
@@ -410,25 +449,65 @@ with tab_backtest:
     if not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()):
         st.warning("Connect to IBKR to enable backtesting data fetching.")
 
-    st.text_input("Symbols (comma-separated)", value="AAPL,MSFT", key='backtest_symbols_input')
+    # Strategy Selection
+    strategy_options = ['TradingStrategy', 'QQQ0DTEScalping']
+    selected_strategy = st.selectbox("Select Strategy", strategy_options, key='backtest_strategy_select')
+
+    # Common backtest parameters
+    if selected_strategy == 'QQQ0DTEScalping':
+        st.text_input("Underlying Symbol", value="QQQ", key='backtest_symbols_input', disabled=True)
+    else:
+        st.text_input("Symbols (comma-separated)", value="AAPL,MSFT", key='backtest_symbols_input')
+
     d_col1, d_col2 = st.columns(2)
-    d_col1.date_input("Start Date", value=datetime.now() - timedelta(days=90), key='backtest_start_date_input')
+    d_col1.date_input("Start Date", value=datetime.now() - timedelta(days=180), key='backtest_start_date_input') # Default 6 months
     d_col2.date_input("End Date", value=datetime.now() - timedelta(days=1), key='backtest_end_date_input')
     
-    st.selectbox("Bar Size", 
+    # For QQQ0DTE, intraday bars are more appropriate
+    default_bar_size_index = 10 # "5 mins"
+    if selected_strategy == 'TradingStrategy': # Generic strategy might use daily or hourly
+        default_bar_size_index = 13 # "1 hour"
+
+    st.selectbox("Bar Size (Underlying)",
                  options=["1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min", "2 mins", "3 mins", "5 mins", "10 mins", "15 mins", "20 mins", "30 mins", "1 hour", "2 hours", "3 hours", "4 hours", "8 hours", "1 day", "1 week", "1 month"], 
-                 index=13, key='backtest_bar_size_input') # Default to 1 hour
+                 index=default_bar_size_index, key='backtest_bar_size_input')
     st.number_input("Initial Capital (Backtest)", value=100000.0, key='backtest_initial_capital_input', format="%.2f")
 
-    st.subheader("Alpha Parameters (Backtest)")
-    col_alpha_bt1, col_alpha_bt2 = st.columns(2)
-    col_alpha_bt1.number_input("Short MA", value=10, key='bt_alpha_short_ma', min_value=1)
-    col_alpha_bt1.number_input("Long MA", value=20, key='bt_alpha_long_ma', min_value=2)
-    col_alpha_bt2.number_input("MA Weight", value=0.6, key='bt_alpha_ma_weight', format="%.2f")
-    col_alpha_bt2.number_input("RSI OS Weight", value=0.25, key='bt_alpha_rsi_os_weight', format="%.2f")
-    col_alpha_bt1.number_input("RSI OB Weight", value=-0.25, key='bt_alpha_rsi_ob_weight', format="%.2f")
-    col_alpha_bt1.number_input("Corr Weight", value=0.15, key='bt_alpha_corr_weight', format="%.2f")
+    # Conditional Parameters based on selected strategy
+    if selected_strategy == 'TradingStrategy':
+        st.subheader("Generic Strategy Alpha Parameters")
+        col_alpha_bt1, col_alpha_bt2 = st.columns(2)
+        col_alpha_bt1.number_input("Short MA", value=10, key='bt_alpha_short_ma', min_value=1)
+        col_alpha_bt1.number_input("Long MA", value=20, key='bt_alpha_long_ma', min_value=2)
+        col_alpha_bt2.number_input("MA Weight", value=0.6, key='bt_alpha_ma_weight', format="%.2f")
+        col_alpha_bt2.number_input("RSI OS Weight", value=0.25, key='bt_alpha_rsi_os_weight', format="%.2f")
+        col_alpha_bt1.number_input("RSI OB Weight", value=-0.25, key='bt_alpha_rsi_ob_weight', format="%.2f")
+        col_alpha_bt1.number_input("Corr Weight", value=0.15, key='bt_alpha_corr_weight', format="%.2f")
 
+    elif selected_strategy == 'QQQ0DTEScalping':
+        st.subheader("QQQ 0DTE Scalping Parameters")
+        st.markdown("Underlying (QQQ) Indicator Parameters:")
+        col_qqq_ind1, col_qqq_ind2 = st.columns(2)
+        col_qqq_ind1.number_input("VWAP Period", value=20, key='bt_qqq_vwap_period', min_value=1)
+        col_qqq_ind1.number_input("Short EMA Period", value=5, key='bt_qqq_short_ema', min_value=1)
+        col_qqq_ind2.number_input("Long EMA Period", value=12, key='bt_qqq_long_ema', min_value=2)
+        col_qqq_ind2.number_input("RSI Period", value=9, key='bt_qqq_rsi_period', min_value=1)
+        col_qqq_ind1.number_input("RSI Oversold", value=30.0, key='bt_qqq_rsi_os', format="%.1f")
+        col_qqq_ind2.number_input("RSI Overbought", value=70.0, key='bt_qqq_rsi_ob', format="%.1f")
+
+        st.markdown("Option Trading Parameters:")
+        col_opt_param1, col_opt_param2, col_opt_param3 = st.columns(3)
+        col_opt_param1.number_input("Strike Offset OTM ($)", value=0.5, key='bt_qqq_strike_offset', format="%.2f", step=0.1)
+        col_opt_param1.number_input("Option SL %", value=0.10, key='bt_qqq_opt_sl', format="%.2f", min_value=0.01, max_value=1.0)
+        col_opt_param2.number_input("Option TP %", value=0.20, key='bt_qqq_opt_tp', format="%.2f", min_value=0.01)
+        col_opt_param2.number_input("Max Daily Trades (Roundtrip)", value=5, key='bt_qqq_max_daily_trades', min_value=1, max_value=100)
+        col_opt_param3.number_input("Max Option Contracts/Trade", value=5, key='bt_qqq_max_opt_contracts', min_value=1)
+        col_opt_param3.number_input("Capital per Option Trade %", value=0.02, key='bt_qqq_opt_capital_pct', format="%.3f", min_value=0.001, max_value=0.1)
+
+        st.markdown("Costs & Slippage (Options):")
+        col_cost_opt1, col_cost_opt2 = st.columns(2)
+        col_cost_opt1.number_input("Cost per Option Contract ($)", value=0.65, key='bt_qqq_opt_cost', format="%.2f", min_value=0.0)
+        col_cost_opt2.number_input("Slippage per Option Contract ($)", value=0.02, key='bt_qqq_opt_slippage', format="%.2f", min_value=0.0)
 
     st.button("Run Backtest", on_click=handle_run_backtest, 
               disabled=not (st.session_state.ibkr_client and st.session_state.ibkr_client.ib.isConnected()))
@@ -441,10 +520,15 @@ with tab_backtest:
             col_bt_m1.metric("Initial Capital", f"${results.get('initial_capital', 0):,.2f}")
             col_bt_m1.metric("Final Capital", f"${results.get('final_capital', 0):,.2f}")
             col_bt_m2.metric("Total Return", f"{results.get('total_return', 0):.2%}")
-            col_bt_m2.metric("Sharpe Ratio", f"${results.get('sharpe_ratio', 0):.2f}")
+            col_bt_m2.metric("Sharpe Ratio", f"{results.get('sharpe_ratio', 0):.2f}") # Corrected: Sharpe Ratio is unitless
             col_bt_m3.metric("Max Drawdown", f"{results.get('max_drawdown', 0):.2%}")
-            col_bt_m3.metric("Number of Trades", f"{results.get('num_trades', 0)}")
             
+            # Display number of trades based on strategy type
+            if st.session_state.get('backtest_strategy_select') == 'QQQ0DTEScalping':
+                col_bt_m3.metric("Option Order Executions", f"{results.get('num_option_order_executions', 0)}")
+            else:
+                col_bt_m3.metric("Number of Stock Trades", f"{results.get('num_stock_trades', 0)}")
+
             st.subheader("Equity Curve (Backtest)")
             if not st.session_state.backtest_equity_curve.empty:
                 st.line_chart(st.session_state.backtest_equity_curve['capital'])

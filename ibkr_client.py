@@ -1,8 +1,11 @@
 import logging
-from ib_insync import IB, util
-from ib_insync.contract import Stock, Forex
-from ib_insync.order import MarketOrder, LimitOrder
+from ib_insync import IB, util, Contract # Make sure Contract is directly importable
+from ib_insync.contract import Stock, Forex, Option # Option class for defining options
+from ib_insync.order import MarketOrder, LimitOrder, Order # Order class for type hinting
+from ib_insync.objects import BarDataList, BarData, Trade # For type hinting
 import pandas as pd
+from typing import List, Optional, Union # For type hinting
+from datetime import datetime, date # For date operations
 
 # Configure logging
 # The global logger is configured in app.py now, or can be configured here if run standalone.
@@ -71,11 +74,11 @@ class IBKRClient:
             self.logger.info(f"Cancelling real-time bars for contract related to conId {con_id_key} before disconnecting.")
             try:
                 # Pass the BarDataList object directly for cancellation
-                self.cancel_realtime_bars(bars_object_to_cancel) 
+                self.cancel_realtime_bars(bars_object_to_cancel)
             except Exception as e:
                 # Log error but continue disconnecting other subscriptions and the client itself
                 self.logger.error(f"Error cancelling real-time bars for conId {con_id_key} during disconnect: {e}", exc_info=True)
-        
+
         if self.ib.isConnected():
             self.ib.disconnect()
             self.logger.info("Successfully disconnected from IBKR.")
@@ -83,16 +86,16 @@ class IBKRClient:
             self.logger.info("Already disconnected or was never connected.")
         self._active_realtime_bars.clear() # Ensure this is cleared
 
-    def qualify_contract(self, contract: Contract) -> Contract | None:
+    def qualify_contract(self, contract: Contract) -> Optional[Contract]:
         """
         Qualifies a contract to resolve ambiguities and fill in details like conId.
         IBKR requires contracts to be qualified before use in most API calls.
 
         Args:
-            contract (Contract): The ib_insync Contract object to qualify (e.g., Stock, Forex).
+            contract (Contract): The ib_insync Contract object to qualify (e.g., Stock, Forex, Option).
 
         Returns:
-            Contract | None: The qualified contract object if successful, otherwise None.
+            Optional[Contract]: The qualified contract object if successful, otherwise None.
         
         Raises:
             Exception: If there's an error during the qualification process from IBKR.
@@ -100,93 +103,110 @@ class IBKRClient:
         self.logger.debug(f"Qualifying contract: {contract}")
         try:
             self.connect() # Ensure connection
+
+            # For options, it's good practice to set a default exchange if not provided, e.g., 'SMART'
+            if isinstance(contract, Option) and not contract.exchange:
+                contract.exchange = 'SMART' # Or specific options exchange like 'CBOE', 'BOX' etc.
+                self.logger.debug(f"Set default exchange 'SMART' for Option contract: {contract.localSymbol if contract.localSymbol else contract.symbol}")
+
             qualified_contracts = self.ib.qualifyContracts(contract)
+
             if qualified_contracts:
                 if len(qualified_contracts) == 1:
                     self.logger.info(f"Contract qualified successfully: {qualified_contracts[0]}")
                     return qualified_contracts[0]
                 else:
-                    # Handle ambiguity: if a SMART contract is preferred and found, use it.
-                    self.logger.warning(f"Contract {contract.symbol if hasattr(contract, 'symbol') else contract} is ambiguous. Found: {qualified_contracts}")
-                    if hasattr(contract, 'exchange') and contract.exchange and contract.exchange.upper() == "SMART":
+                    # Handle ambiguity
+                    self.logger.warning(f"Contract {contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol} is ambiguous. Found: {qualified_contracts}")
+                    # If it's an option and multiple matches, it might be due to different primaryExch, multipliers, etc.
+                    # A common strategy for options is to pick the one with the standard multiplier (usually 100) if SMART.
+                    if isinstance(contract, Option):
                         for qc in qualified_contracts:
+                            if hasattr(qc, 'multiplier') and qc.multiplier == '100' and qc.exchange == 'SMART': # Multiplier is string
+                                self.logger.info(f"Returning SMART option with multiplier 100 for ambiguous query: {qc}")
+                                return qc
+                    elif hasattr(contract, 'exchange') and contract.exchange and contract.exchange.upper() == "SMART":
+                        for qc in qualified_contracts: # Fallback for non-options or if option specific logic failed
                             if qc.exchange == "SMART":
                                 self.logger.info(f"Returning first SMART contract for ambiguous query: {qc}")
                                 return qc
-                    # If no specific preference or SMART not found among ambiguous, log error or return first as fallback.
-                    # Current logic from previous version returns the first one if original contract.exchange was "SMART".
-                    # A safer default might be to return None if truly ambiguous and not resolved.
-                    self.logger.warning(f"Ambiguous contract {contract.symbol if hasattr(contract, 'symbol') else contract}. Returning the first from list as a fallback: {qualified_contracts[0]}")
+
+                    self.logger.warning(f"Ambiguous contract {contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol}. Returning the first from list as a fallback: {qualified_contracts[0]}")
                     return qualified_contracts[0] # Fallback to first, user should be specific.
             else:
-                self.logger.error(f"Could not qualify contract: {contract.symbol if hasattr(contract, 'symbol') else contract}. No matching contract found by IBKR.")
+                self.logger.error(f"Could not qualify contract: {contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol}. No matching contract found by IBKR.")
                 return None
         except Exception as e:
-            self.logger.error(f"Error qualifying contract {contract.symbol if hasattr(contract, 'symbol') else contract}: {e}", exc_info=True)
+            self.logger.error(f"Error qualifying contract {contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol}: {e}", exc_info=True)
             raise # Re-raise to signal failure to caller
 
-    def fetch_historical_data(self, contract: Contract, endDateTime: str, durationStr: str, 
-                              barSizeSetting: str, whatToShow: str, useRTH: bool, 
-                              formatDate: int = 1) -> pd.DataFrame:
+    def fetch_historical_data(self, contract: Contract, endDateTime: str, durationStr: str,
+                              barSizeSetting: str, whatToShow: str, useRTH: bool,
+                              formatDate: int = 1, keepUpToDate: bool = False) -> Optional[pd.DataFrame]:
         """
         Fetches historical bar data from IBKR.
 
         Args:
-            contract (Contract): The qualified ib_insync Contract object.
+            contract (Contract): The ib_insync Contract object (should be qualified if possible,
+                                 but this method will attempt to qualify it if not).
             endDateTime (str): The end date/time of the historical data request.
                                Format: 'yyyyMMdd HH:mm:ss [zzz]' or '' for current time.
             durationStr (str): The duration of the data request (e.g., '30 D', '1 M', '1 Y').
             barSizeSetting (str): The bar size (e.g., '1 min', '1 hour', '1 day').
-            whatToShow (str): The type of data to show (e.g., 'TRADES', 'MIDPOINT', 'BID', 'ASK').
+            whatToShow (str): The type of data to show (e.g., 'TRADES', 'MIDPOINT', 'BID', 'ASK', 'OPTION_IMPLIED_VOLATILITY').
             useRTH (bool): If True, data is returned for regular trading hours only.
             formatDate (int): Date formatting for IBKR (1 for yyyyMMdd HH:mm:ss, 2 for system time zone).
+            keepUpToDate (bool): If True, continuously update with new bars (primarily for live data, less common for historical fetches).
 
         Returns:
-            pd.DataFrame: A DataFrame containing the historical bar data, or an empty DataFrame if no data.
+            Optional[pd.DataFrame]: A DataFrame containing the historical bar data, or None if no data or error.
         
         Raises:
-            Exception: If there's an error during data fetching from IBKR.
+            Exception: If there's an error during data fetching from IBKR that is not handled internally.
         """
-        self.logger.info(f"Fetching historical data for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}: "
-                         f"End: {endDateTime}, Duration: {durationStr}, Bar: {barSizeSetting}")
+        contract_identifier = contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol
+        self.logger.info(f"Fetching historical data for {contract_identifier}: "
+                         f"End: {endDateTime}, Duration: {durationStr}, Bar: {barSizeSetting}, WhatToShow: {whatToShow}")
         try:
-            self.connect() 
+            self.connect()
             
-            qualified_contract = self.qualify_contract(contract)
-            if not qualified_contract:
-                self.logger.warning(f"Historical data fetch failed for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol} due to contract qualification failure.")
-                return pd.DataFrame()
+            # Attempt to qualify the contract if it doesn't have a conId yet.
+            # For already qualified contracts (e.g., from option chain fetching), this will be quick.
+            if not contract.conId:
+                self.logger.debug(f"Contract {contract_identifier} does not have conId, attempting to qualify.")
+                qualified_contract = self.qualify_contract(contract)
+                if not qualified_contract:
+                    self.logger.warning(f"Historical data fetch failed for {contract_identifier} due to contract qualification failure.")
+                    return None # Return None instead of empty DataFrame for clarity
+            else:
+                qualified_contract = contract # Assume it's already qualified
 
             bars = self.ib.reqHistoricalData(
-                qualified_contract,
-                contract,
+                qualified_contract, # Use the qualified contract
                 endDateTime=endDateTime,
                 durationStr=durationStr,
                 barSizeSetting=barSizeSetting,
                 whatToShow=whatToShow,
                 useRTH=useRTH,
-                endDateTime=endDateTime,
-                durationStr=durationStr,
-                barSizeSetting=barSizeSetting,
-                whatToShow=whatToShow,
-                useRTH=useRTH,
-                formatDate=formatDate 
+                formatDate=formatDate,
+                keepUpToDate=keepUpToDate
             )
             if bars:
                 df = util.df(bars) # Converts list of BarData to DataFrame
-                self.logger.info(f"Fetched {len(bars)} bars for {qualified_contract.symbol}.")
-                # Ensure 'date' column is datetime objects if present, util.df usually handles this.
-                if 'date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['date']):
-                     df['date'] = pd.to_datetime(df['date']) # pragma: no cover (util.df should handle)
+                self.logger.info(f"Fetched {len(bars)} bars for {qualified_contract.localSymbol if qualified_contract.localSymbol else qualified_contract.symbol}.")
+                if df is not None and 'date' in df.columns: # util.df might return None if bars is empty or malformed
+                    if not pd.api.types.is_datetime64_any_dtype(df['date']):
+                        df['date'] = pd.to_datetime(df['date']) # pragma: no cover
+                    df.set_index('date', inplace=True) # Standardize to have 'date' as index
                 return df
             else:
-                self.logger.warning(f"No historical data returned for {qualified_contract.symbol}.")
-                return pd.DataFrame()
+                self.logger.warning(f"No historical data returned for {qualified_contract.localSymbol if qualified_contract.localSymbol else qualified_contract.symbol}.")
+                return None
         except Exception as e:
-            self.logger.error(f"Error fetching historical data for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}: {e}", exc_info=True)
-            raise
+            self.logger.error(f"Error fetching historical data for {contract_identifier}: {e}", exc_info=True)
+            raise # Re-raise to signal failure to caller
 
-    def place_paper_order(self, contract: Contract, order: Order) -> Trade | None:
+    def place_paper_order(self, contract: Contract, order: Order) -> Optional[Trade]:
         """
         Places a paper order.
         Note: For paper trading, orders are simulated by IB TWS/Gateway.
@@ -205,22 +225,45 @@ class IBKRClient:
         Raises:
             Exception: If there's an error during order placement from IBKR.
         """
-        self.logger.info(f"Attempting to place paper order for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}: "
+        Places a paper trading order.
+        Note: Ensure you are connected to a paper trading account in TWS/Gateway.
+
+        Args:
+            contract (Contract): The ib_insync Contract object for the instrument.
+                                 Should be qualified before calling this method.
+            order (Order): The ib_insync Order object (e.g., MarketOrder, LimitOrder).
+
+        Returns:
+            Optional[Trade]: The ib_insync Trade object if order placement was initiated, otherwise None.
+                             The Trade object tracks the order's status and fills.
+
+        Raises:
+            Exception: If there's an error during order placement from IBKR.
+        """
+        contract_identifier = contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol
+        self.logger.info(f"Attempting to place paper order for {contract_identifier}: "
                          f"{order.action} {order.totalQuantity} units.")
         try:
-            self.connect() 
+            self.connect()
 
-            qualified_contract = self.qualify_contract(contract)
-            if not qualified_contract:
-                self.logger.error(f"Cannot place order for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}, contract qualification failed.")
-                return None
+            # Qualification should ideally happen before calling place_order,
+            # but as a safeguard, ensure it has conId.
+            if not contract.conId:
+                q_contract = self.qualify_contract(contract)
+                if not q_contract:
+                    self.logger.error(f"Cannot place order for {contract_identifier}, contract qualification failed.")
+                    return None
+                final_contract = q_contract
+            else:
+                final_contract = contract
+
 
             # Optionally, specify paper trading account if managing multiple accounts
             # if self.ib.managedAccounts():
             #     order.account = self.ib.managedAccounts()[0] # Or a specific paper account
 
-            trade = self.ib.placeOrder(qualified_contract, order)
-            self.logger.info(f"Paper order placed for {qualified_contract.symbol}. OrderId: {trade.order.orderId}, "
+            trade = self.ib.placeOrder(final_contract, order) # Use the final_contract
+            self.logger.info(f"Paper order placed for {final_contract.localSymbol if final_contract.localSymbol else final_contract.symbol}. OrderId: {trade.order.orderId}, "
                              f"PermId: {trade.order.permId}, Status: {trade.orderStatus.status}")
             
             # For more advanced handling, you can register callbacks for order status changes:
@@ -229,11 +272,11 @@ class IBKRClient:
             
             return trade
         except Exception as e:
-            self.logger.error(f"Error placing paper order for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}: {e}", exc_info=True)
+            self.logger.error(f"Error placing paper order for {contract_identifier}: {e}", exc_info=True)
             raise
 
-    def subscribe_realtime_bars(self, contract: Contract, callback_function, 
-                                barSize: int = 5, whatToShow: str = 'TRADES', useRTH: bool = True) -> util.BarDataList | None:
+    def subscribe_realtime_bars(self, contract: Contract, callback_function,
+                                barSize: int = 5, whatToShow: str = 'TRADES', useRTH: bool = True) -> Optional[BarDataList]:
         """
         Subscribes to real-time bars for a given contract.
 
@@ -254,48 +297,52 @@ class IBKRClient:
         Raises:
             Exception: If there's an error during subscription setup from IBKR.
         """
-        self.logger.info(f"Attempting to subscribe to real-time bars for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}...")
+        contract_identifier = contract.localSymbol if hasattr(contract, 'localSymbol') and contract.localSymbol else contract.symbol
+        self.logger.info(f"Attempting to subscribe to real-time bars for {contract_identifier}...")
         try:
-            self.connect() 
+            self.connect()
             
-            qualified_contract = self.qualify_contract(contract)
-            if not qualified_contract:
-                self.logger.error(f"Cannot subscribe to real-time bars for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}, contract qualification failed.")
-                return None
+            # Ensure contract is qualified
+            if not contract.conId:
+                q_contract = self.qualify_contract(contract)
+                if not q_contract:
+                    self.logger.error(f"Cannot subscribe to real-time bars for {contract_identifier}, contract qualification failed.")
+                    return None
+                final_contract = q_contract
+            else:
+                final_contract = contract
 
-            con_id = qualified_contract.conId
+            con_id = final_contract.conId
             if con_id in self._active_realtime_bars:
-                self.logger.warning(f"Already subscribed to real-time bars for {qualified_contract.symbol} (ConID: {con_id}). Returning existing subscription object.")
+                self.logger.warning(f"Already subscribed to real-time bars for {final_contract.localSymbol if final_contract.localSymbol else final_contract.symbol} (ConID: {con_id}). Returning existing subscription object.")
                 return self._active_realtime_bars[con_id]['bars']
 
-            self.logger.info(f"Subscribing to real-time bars for {qualified_contract.symbol} (ConID: {con_id}), BarSize: {barSize}s, WhatToShow: {whatToShow}, UseRTH: {useRTH}")
+            self.logger.info(f"Subscribing to real-time bars for {final_contract.localSymbol if final_contract.localSymbol else final_contract.symbol} (ConID: {con_id}), BarSize: {barSize}s, WhatToShow: {whatToShow}, UseRTH: {useRTH}")
             
-            # reqRealTimeBars returns a BarDataList which is an event source for bar updates.
-            bars = self.ib.reqRealTimeBars(
-                contract=qualified_contract,
-                barSize=barSize, # Note: IB API has limitations, 5 seconds is standard for TRADES.
+            bars_obj = self.ib.reqRealTimeBars( # Renamed variable to avoid conflict with 'bars' in _on_bar_update
+                contract=final_contract,
+                barSize=barSize,
                 whatToShow=whatToShow,
                 useRTH=useRTH
             )
             
             self._active_realtime_bars[con_id] = {
-                'contract': qualified_contract, 
-                'bars': bars, # Store the BarDataList object
+                'contract': final_contract,
+                'bars': bars_obj, # Store the BarDataList object
                 'callback': callback_function
             }
-            bars.updateEvent += self._on_bar_update # Register internal handler for new bar events
+            bars_obj.updateEvent += self._on_bar_update # Register internal handler
 
-            self.logger.info(f"Successfully subscribed to real-time bars for {qualified_contract.symbol}. Listening for updates...")
-            return bars
+            self.logger.info(f"Successfully subscribed to real-time bars for {final_contract.localSymbol if final_contract.localSymbol else final_contract.symbol}. Listening for updates...")
+            return bars_obj
             
         except Exception as e:
-            self.logger.error(f"Error subscribing to real-time bars for {contract.symbol if hasattr(contract, 'symbol') else contract.localSymbol}: {e}", exc_info=True)
-            # Clean up if partial subscription happened before error
-            if 'qualified_contract' in locals() and qualified_contract and qualified_contract.conId in self._active_realtime_bars:
-                 del self._active_realtime_bars[qualified_contract.conId] # pragma: no cover (hard to test this specific path)
+            self.logger.error(f"Error subscribing to real-time bars for {contract_identifier}: {e}", exc_info=True)
+            if 'final_contract' in locals() and final_contract and final_contract.conId in self._active_realtime_bars:
+                 del self._active_realtime_bars[final_contract.conId]
             raise
 
-    def _on_bar_update(self, bars: util.BarDataList, hasNewBar: bool):
+    def _on_bar_update(self, updated_bars: BarDataList, hasNewBar: bool): # Parameter name changed from 'bars' to 'updated_bars'
         """
         Internal callback triggered by ib_insync when new bar data is received
         for any real-time bar subscription. It then calls the user-provided callback.
@@ -306,43 +353,43 @@ class IBKRClient:
             hasNewBar (bool): True if bars[-1] is a new bar, False if it's an update to the last bar.
         """
         if hasNewBar:
-            # Find the subscription details (contract, user_callback) associated with this 'bars' object
+            # Find the subscription details (contract, user_callback) associated with this 'updated_bars' object
             found_sub_info = None
             for con_id_iter, sub_info_iter in self._active_realtime_bars.items():
-                if sub_info_iter['bars'] is bars: # Check if it's the same BarDataList object
+                if sub_info_iter['bars'] is updated_bars: # Check if it's the same BarDataList object
                     found_sub_info = sub_info_iter
                     break
             
             if found_sub_info:
-                latest_bar: BarData = bars[-1] # The newest bar data
-                contract_info: Contract = found_sub_info['contract']
+                latest_bar: BarData = updated_bars[-1] # The newest bar data
+                contract_info: Contract = found_sub_info['contract'] # This is the qualified contract
                 user_callback = found_sub_info['callback']
                 
-                self.logger.debug(f"New bar for {contract_info.symbol}: Time={latest_bar.time}, Close={latest_bar.close}")
+                contract_identifier = contract_info.localSymbol if contract_info.localSymbol else contract_info.symbol
+                self.logger.debug(f"New bar for {contract_identifier}: Time={latest_bar.time}, Close={latest_bar.close}")
                 
                 try:
                     # Prepare a dictionary representation of the bar for the user callback
                     bar_data_dict = {
-                        "time": latest_bar.time,    # datetime object (usually)
-                        "open": latest_bar.open_,
+                        "time": latest_bar.time,
+                        "open": latest_bar.open_, # Note: open_ (with underscore) for BarData
                         "high": latest_bar.high,
                         "low": latest_bar.low,
                         "close": latest_bar.close,
                         "volume": latest_bar.volume,
-                        "wap": latest_bar.wap,      # Weighted Average Price
-                        "count": latest_bar.count,  # Number of trades in the bar
-                        "symbol": contract_info.symbol, # Convenience: add symbol
-                        "conId": contract_info.conId    # Convenience: add conId
+                        "wap": latest_bar.wap,
+                        "count": latest_bar.count,
+                        "symbol": contract_identifier,
+                        "conId": contract_info.conId
                     }
-                    user_callback(bar_data_dict, contract_info)
+                    user_callback(bar_data_dict, contract_info) # Pass the qualified contract_info
                 except Exception as e:
-                    self.logger.error(f"Error executing user-provided callback for {contract_info.symbol}: {e}", exc_info=True)
+                    self.logger.error(f"Error executing user-provided callback for {contract_identifier}: {e}", exc_info=True)
             else:
-                # This should ideally not happen if subscription management is correct.
-                self.logger.warning(f"Received bar update for an untracked or unknown BarDataList subscription. Bar time: {bars[-1].time if bars and bars[-1] else 'N/A'}")
+                self.logger.warning(f"Received bar update for an untracked subscription. Bar time: {updated_bars[-1].time if updated_bars and updated_bars[-1] else 'N/A'}")
 
 
-    def cancel_realtime_bars(self, contract_or_bars_object: Contract | util.BarDataList):
+    def cancel_realtime_bars(self, contract_or_bars_object: Union[Contract, BarDataList]):
         """
         Cancels an active real-time bar subscription.
 
@@ -356,71 +403,64 @@ class IBKRClient:
         """
         self.logger.info(f"Attempting to cancel real-time bars for: {contract_or_bars_object}")
         try:
-            self.connect() 
+            self.connect()
             
             con_id_to_cancel = None
             bars_obj_to_cancel = None
             target_symbol_for_log = "Unknown"
 
             if isinstance(contract_or_bars_object, Contract):
-                # If it's a contract, we need its conId.
-                # It's best if it's already qualified. If not, qualify it.
-                # Then find the BarDataList from our _active_realtime_bars using conId.
-                q_contract = self.qualify_contract(contract_or_bars_object) # Ensure we have conId
-                if q_contract:
-                    con_id_to_cancel = q_contract.conId
-                    target_symbol_for_log = q_contract.symbol
+                # If it's a contract object, it should ideally be qualified or have conId.
+                # If not, qualify it to get conId.
+                final_contract_for_cancel = contract_or_bars_object
+                if not final_contract_for_cancel.conId:
+                    self.logger.debug(f"Contract for cancellation needs qualification: {final_contract_for_cancel}")
+                    final_contract_for_cancel = self.qualify_contract(contract_or_bars_object)
+
+                if final_contract_for_cancel and final_contract_for_cancel.conId:
+                    con_id_to_cancel = final_contract_for_cancel.conId
+                    target_symbol_for_log = final_contract_for_cancel.localSymbol or final_contract_for_cancel.symbol
                     if con_id_to_cancel in self._active_realtime_bars:
                         bars_obj_to_cancel = self._active_realtime_bars[con_id_to_cancel]['bars']
                     else:
-                        self.logger.warning(f"No active subscription found for conId {con_id_to_cancel} ({target_symbol_for_log}) from the provided contract.")
-                        return # Nothing to cancel if not tracked
+                        self.logger.warning(f"No active subscription found for conId {con_id_to_cancel} ({target_symbol_for_log}) from the provided contract to cancel.")
+                        return
                 else:
-                    self.logger.error(f"Could not qualify contract for cancellation: {contract_or_bars_object.symbol if hasattr(contract_or_bars_object, 'symbol') else contract_or_bars_object}. Cannot determine conId.")
+                    self.logger.error(f"Could not determine conId for cancellation from contract: {contract_or_bars_object}")
                     return
-            elif isinstance(contract_or_bars_object, util.BarDataList):
-                # If it's a BarDataList object, we can use it directly.
-                # Find its conId from its associated contract to update our tracking.
+            elif isinstance(contract_or_bars_object, BarDataList):
                 bars_obj_to_cancel = contract_or_bars_object
-                if hasattr(bars_obj_to_cancel, 'contract') and bars_obj_to_cancel.contract:
+                if hasattr(bars_obj_to_cancel, 'contract') and bars_obj_to_cancel.contract and bars_obj_to_cancel.contract.conId:
                     con_id_to_cancel = bars_obj_to_cancel.contract.conId
-                    target_symbol_for_log = bars_obj_to_cancel.contract.symbol
-                else: # pragma: no cover (BarDataList should always have .contract from reqRealTimeBars)
-                    self.logger.error("Invalid BarDataList object passed for cancellation: missing .contract attribute.")
+                    target_symbol_for_log = bars_obj_to_cancel.contract.localSymbol or bars_obj_to_cancel.contract.symbol
+                else:
+                    self.logger.error("Invalid BarDataList object for cancellation: missing .contract or conId.")
                     return
             else:
-                self.logger.error(f"Invalid argument type for cancel_realtime_bars: {type(contract_or_bars_object)}. "
-                                  "Must be a Contract or BarDataList object.")
+                self.logger.error(f"Invalid argument type for cancel_realtime_bars: {type(contract_or_bars_object)}. Must be Contract or BarDataList.")
                 return
 
             if con_id_to_cancel and con_id_to_cancel in self._active_realtime_bars:
-                # Ensure we have the correct bars object if we started with a contract
-                if not bars_obj_to_cancel: # This case should be covered by logic above, but as safeguard
-                    bars_obj_to_cancel = self._active_realtime_bars[con_id_to_cancel]['bars'] # pragma: no cover
+                if not bars_obj_to_cancel: # Should be set if con_id_to_cancel was found via Contract object
+                     bars_obj_to_cancel = self._active_realtime_bars[con_id_to_cancel]['bars']
                 
                 self.logger.info(f"Cancelling real-time bars subscription for {target_symbol_for_log} (ConID: {con_id_to_cancel}).")
                 
-                # De-register our internal handler from the updateEvent
-                # Check if it's actually registered to avoid errors on multiple cancel calls or race conditions.
-                # This requires careful checking as ib_insync's event system might not expose handlers list directly.
-                # A simple try-except can also work if removing a non-existent handler raises specific error.
                 try:
-                    # Assuming __isub__ ( -= ) is robust to removing non-existent handlers or doesn't error.
                     bars_obj_to_cancel.updateEvent -= self._on_bar_update
-                except Exception as event_err: # pragma: no cover (specific exception type depends on ib_insync)
-                    self.logger.warning(f"Could not de-register _on_bar_update for {target_symbol_for_log} (ConID: {con_id_to_cancel}). "
-                                        f"It might have been already removed or not set. Error: {event_err}")
+                except Exception as event_err:
+                    self.logger.warning(f"Could not de-register _on_bar_update for {target_symbol_for_log} (ConID: {con_id_to_cancel}). Error: {event_err}")
 
                 self.ib.cancelRealTimeBars(bars_obj_to_cancel)
-                del self._active_realtime_bars[con_id_to_cancel] # Remove from our tracking
+                del self._active_realtime_bars[con_id_to_cancel]
                 self.logger.info(f"Successfully cancelled real-time bars for {target_symbol_for_log}.")
-            elif con_id_to_cancel: # conId was found but not in our active list
+            elif con_id_to_cancel:
                 self.logger.warning(f"No active real-time subscription found in internal tracking for {target_symbol_for_log} (ConID: {con_id_to_cancel}) to cancel.")
-            # If con_id_to_cancel was never found (e.g. contract qualification failed), already handled.
+            # If con_id_to_cancel was never found, already handled.
 
         except Exception as e:
             self.logger.error(f"Error cancelling real-time bars for {target_symbol_for_log}: {e}", exc_info=True)
-            raise # Re-raise to signal failure to caller
+            raise
 
     def run_async_event_loop_if_needed(self) -> bool:
         """
@@ -546,118 +586,237 @@ if __name__ == '__main__': # pragma: no cover
             # If util.startLoop was used, the daemon thread should exit eventually after disconnect.
             # If ib.run() was used directly and blocking, ib.stop() would be needed here.
         logger.info("IBKRClient example finished.")
-    # This is a simple example of how to use the IBKRClient
-    # Replace with your actual connection details and desired contract/order
 
-    # Configuration (ideally from a config file)
-    IBKR_HOST = '127.0.0.1'
-    IBKR_PORT = 7497  # 7497 for TWS Paper, 4002 for Gateway Paper
-    IBKR_CLIENT_ID = 1
+    # --- Methods for Options Trading ---
 
-    client = IBKRClient(host=IBKR_HOST, port=IBKR_PORT, clientId=IBKR_CLIENT_ID)
+    def fetch_option_chain(self, underlying_symbol: str, expiration_date: Optional[str] = None, underlying_con_id: Optional[int] = None) -> List[Contract]:
+        """
+        Fetches the option chain for a given underlying symbol and optionally an expiration date.
+
+        Args:
+            underlying_symbol (str): The symbol of the underlying asset (e.g., 'QQQ').
+            expiration_date (Optional[str]): Specific expiration date in 'YYYYMMDD' format.
+                                             If None, fetches for all available expirations.
+            underlying_con_id (Optional[int]): The conId of the underlying asset. If not provided,
+                                               it will be fetched.
+
+        Returns:
+            List[Contract]: A list of qualified ib_insync.Option contracts.
+        """
+        self.logger.info(f"Fetching option chain for {underlying_symbol}, Expiration: {expiration_date or 'All'}")
+        try:
+            self.connect()
+
+            if not underlying_con_id:
+                # First, get the conId of the underlying stock/ETF
+                underlying_contract = Stock(underlying_symbol, 'SMART', 'USD')
+                qualified_underlying = self.qualify_contract(underlying_contract)
+                if not qualified_underlying or not qualified_underlying.conId:
+                    self.logger.error(f"Could not qualify underlying symbol {underlying_symbol} to get conId.")
+                    return []
+                underlying_con_id = qualified_underlying.conId
+                self.logger.info(f"Underlying {underlying_symbol} conId: {underlying_con_id}")
+
+            # Fetch option chain details
+            # reqSecDefOptParams returns a list of OptionChain objects
+            chains = self.ib.reqSecDefOptParams(underlyingSymbol=underlying_symbol, futFopExchange='', underlyingSecType='STK', underlyingConId=underlying_con_id)
+
+            if not chains:
+                self.logger.warning(f"No option chain data returned for {underlying_symbol} with conId {underlying_con_id}.")
+                return []
+
+            option_contracts = []
+            # Iterate through exchanges and expirations if needed
+            # For simplicity, assuming one primary exchange or SMART handles it.
+            # The chains object contains a list of exchanges, each with expirations and strikes.
+            # Example: chains[0].expirations, chains[0].strikes
+
+            target_expirations = []
+            if expiration_date: # Specific expiration
+                target_expirations.append(expiration_date)
+            else: # All expirations found for the primary exchange in the chain
+                if chains[0].expirations: # chains[0] is usually the primary/SMART
+                    target_expirations.extend(chains[0].expirations)
+
+            if not target_expirations:
+                self.logger.warning(f"No expirations found for {underlying_symbol} in the received chain data.")
+                return []
+
+            self.logger.debug(f"Target expirations for {underlying_symbol}: {target_expirations}")
+
+            # Get all strikes for the primary exchange in the chain
+            # This might fetch a very large number of strikes.
+            # For 0DTE, we might want to filter strikes around the current underlying price later.
+            all_strikes = chains[0].strikes
+            if not all_strikes:
+                self.logger.warning(f"No strikes found for {underlying_symbol} in the received chain data.")
+                return []
+
+            self.logger.debug(f"Number of strikes found for {underlying_symbol}: {len(all_strikes)}")
+
+
+            # Create Option contract objects for each combination
+            for exp in target_expirations:
+                for strike in all_strikes:
+                    for right in ['C', 'P']: # Call and Put
+                        # Create an unqualified Option contract
+                        opt_contract = Option(
+                            symbol=underlying_symbol,
+                            lastTradeDateOrContractMonth=exp, # Format YYYYMMDD
+                            strike=strike,
+                            right=right,
+                            exchange='SMART', # Use SMART for broad routing
+                            multiplier='100', # Standard multiplier
+                            currency='USD'
+                        )
+                        option_contracts.append(opt_contract)
+
+            self.logger.info(f"Generated {len(option_contracts)} potential option contracts for {underlying_symbol} across {len(target_expirations)} expiration(s). Qualifying them now...")
+
+            # Qualify all generated contracts
+            # This can be slow if many contracts are generated.
+            # Consider qualifying them in batches or as needed.
+            qualified_options = []
+            for opt_c in option_contracts:
+                # reqContractDetails can also be used to find specific options,
+                # but qualifying a fully defined Option object is often more direct if parameters are known.
+                q_opt = self.qualify_contract(opt_c) # This uses the existing qualify_contract method
+                if q_opt and q_opt.conId: # Ensure it's a valid, qualified contract with a conId
+                    qualified_options.append(q_opt)
+                else:
+                    self.logger.debug(f"Failed to qualify option: {opt_c.localSymbol if opt_c.localSymbol else opt_c}")
+
+
+            self.logger.info(f"Successfully qualified {len(qualified_options)} option contracts for {underlying_symbol}.")
+            return qualified_options
+
+        except Exception as e:
+            self.logger.error(f"Error fetching option chain for {underlying_symbol}: {e}", exc_info=True)
+            return [] # Return empty list on error
+
+    # The main method can be updated to test option chain fetching
+    # ... (rest of the class)
+
+if __name__ == '__main__': # pragma: no cover
+    # This block is for basic manual testing or demonstration.
+    # Ensure TWS or Gateway is running on port 7497 (paper) or 7496 (live) for this to work.
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+
+    client = IBKRClient(host='127.0.0.1', port=7497, clientId=12) # Use a unique clientId
+
+    def my_simple_bar_handler(bar_data_dict, contract_object):
+        logger.info(f"BAR HANDLER: Symbol={bar_data_dict['symbol']}, Time={bar_data_dict['time']}, Close={bar_data_dict['close']}")
 
     try:
         client.connect()
+        if client.run_async_event_loop_if_needed():
+            logger.info("Event loop is running.")
 
-        # Example 1: Fetch historical data for AAPL stock
-        # aapl_stock_contract_details = Stock(symbol='AAPL', exchange='SMART', currency='USD')
-        # Note: For live examples, ensure TWS/Gateway is running and connected.
-        # And that you are connected to a Paper account for testing orders.
+            # --- Test Option Chain Fetching ---
+            underlying_sym = 'QQQ'
+            # today_date_str = datetime.now().strftime('%Y%m%d') # For 0DTE, use today's date
+            # logger.info(f"Attempting to fetch 0DTE option chain for {underlying_sym} for expiry {today_date_str}")
+            # option_chain = client.fetch_option_chain(underlying_sym, expiration_date=today_date_str)
 
-        # qualified_aapl_contract = client.qualify_contract(aapl_stock_contract_details)
-        # if qualified_aapl_contract:
-        #     historical_data_df = client.fetch_historical_data(
-        #         contract=qualified_aapl_contract,
-        #         endDateTime='',  # Empty for current time
-        #         durationStr='30 D',
-        #         barSizeSetting='1 hour',
-        #         whatToShow='TRADES',
-        #         useRTH=True
-        #     )
-        #     if not historical_data_df.empty:
-        #         print("\nHistorical Data for AAPL:")
-        #         print(historical_data_df.head())
-
-        # Example 2: Place a paper order for a stock
-        # tsla_stock_details = Stock(symbol='TSLA', exchange='SMART', currency='USD')
-        # qualified_tsla_contract = client.qualify_contract(tsla_stock_details)
-        # if qualified_tsla_contract:
-        #     market_order = MarketOrder(action='BUY', totalQuantity=1) # Buy 1 share of TSLA at market price
-        #     # paper_trade = client.place_paper_order(qualified_tsla_contract, market_order)
-        #     # if paper_trade:
-        #     #     print(f"\nPaper trade placed for TSLA: {paper_trade}")
-        #     #     print(f"Order Status: {paper_trade.orderStatus.status}")
-        #     #     # client.ib.sleep(5) # Wait for potential status updates
-        #     #     # print(f"Updated Order Status: {paper_trade.orderStatus.status}")
-        # else:
-        #     logging.error("Could not place order for TSLA, contract qualification failed.")
+            # For testing, let's fetch a known future expiry if 0DTE might not exist or be too volatile for simple test
+            # Find a valid near-term expiration first
+            chains_data = client.ib.reqSecDefOptParams(underlyingSymbol=underlying_sym, futFopExchange='', underlyingSecType='STK', underlyingConId=client.qualify_contract(Stock(underlying_sym, 'SMART', 'USD')).conId)
+            test_expiry_date = None
+            if chains_data and chains_data[0].expirations:
+                # Try to find an expiration that is a Friday, not too far out.
+                for exp_str in chains_data[0].expirations:
+                    exp_dt = datetime.strptime(exp_str, '%Y%m%d').date()
+                    if exp_dt.weekday() == 4 and (exp_dt - date.today()).days > 5 and (exp_dt - date.today()).days < 60 : # Friday, 5-60 days out
+                        test_expiry_date = exp_str
+                        break
+                if not test_expiry_date: # Fallback to first available if no suitable Friday found
+                    test_expiry_date = chains_data[0].expirations[0]
 
 
-        # Example 3: Fetch historical data for EUR.USD Forex pair
-        # eurusd_forex_details = Forex('EURUSD') # Forex contracts are often simpler to qualify
-        # qualified_eurusd_contract = client.qualify_contract(eurusd_forex_details) # Should find 'IDEALPRO'
-        # if qualified_eurusd_contract:
-        #     historical_forex_data_df = client.fetch_historical_data(
-        #         contract=qualified_eurusd_contract,
-        #         endDateTime='',
-        #         durationStr='1 M', # 1 Month
-        #         barSizeSetting='4 hours',
-        #         whatToShow='MIDPOINT', # or ASK, BID
-        #         useRTH=True
-        #     )
-        #     if not historical_forex_data_df.empty:
-        #         print("\nHistorical Data for EUR.USD:")
-        #         print(historical_forex_data_df.head())
-        # else:
-        #    logging.error("Could not get historical data for EURUSD, contract qualification failed.")
-        
-        # Example 4: Subscribe to real-time bars for a stock (e.g., MSFT)
-        # This part requires the event loop to be running.
-        # def my_bar_update_handler(bar_dict, contract_object):
-        #    # Note: bar_dict now contains 'symbol' and 'conId'
-        #    print(f"Real-time bar for {bar_dict['symbol']} (ConID: {bar_dict['conId']}): "
-        #          f"{bar_dict['time']} - O: {bar_dict['open']} H: {bar_dict['high']} L: {bar_dict['low']} C: {bar_dict['close']} V: {bar_dict['volume']}")
+            if test_expiry_date:
+                logger.info(f"Attempting to fetch option chain for {underlying_sym} for specific expiry {test_expiry_date}")
+                option_chain = client.fetch_option_chain(underlying_sym, expiration_date=test_expiry_date)
 
-        # msft_stock_details = Stock(symbol='MSFT', exchange='SMART', currency='USD')
-        
-        # client.connect() # Ensure connected before starting loop management
-        # loop_running = client.run_async_event_loop_if_needed()
+                if option_chain:
+                    logger.info(f"Fetched {len(option_chain)} contracts for {underlying_sym} expiring {test_expiry_date}.")
+                    # Log details of a few contracts
+                    for i, opt_contract in enumerate(option_chain[:3]): # Log first 3
+                        logger.info(f"  {i+1}. {opt_contract.localSymbol}, Strike: {opt_contract.strike}, Type: {opt_contract.right}, ConID: {opt_contract.conId}")
 
-        # if loop_running and client.ib.isConnected():
-        #    qualified_msft_contract = client.qualify_contract(msft_stock_details)
-        #    if qualified_msft_contract:
-        #        logging.info(f"Attempting to subscribe to MSFT real-time bars...")
-        #        active_subscription = client.subscribe_realtime_bars(qualified_msft_contract, my_bar_update_handler, barSize=5, whatToShow="TRADES", useRTH=True)
-        #        if active_subscription:
-        #            logging.info("Successfully initiated MSFT real-time bar subscription. Running for 30 seconds...")
-        #            client.ib.sleep(30) # Keep the connection alive and processing events for 30s
-        #            logging.info("Finished 30s real-time bar test. Cancelling subscription.")
-        #            client.cancel_realtime_bars(active_subscription) 
-        #            logging.info("MSFT real-time subscription cancelled.")
-        #        else:
-        #            logging.error("Failed to subscribe to MSFT real-time bars.")
-        #    else:
-        #        logging.error("Could not subscribe to MSFT real-time bars, contract qualification failed.")
-        # else:
-        #    logging.error("IBKR Client not connected or event loop not running. Cannot run real-time example.")
+                    # Test fetching historical data for one of these options
+                    if len(option_chain) > 0:
+                        sample_option_contract = option_chain[len(option_chain)//2] # Pick one from middle
+                        logger.info(f"Fetching historical data for option: {sample_option_contract.localSymbol}")
+                        # Fetch 1 day of 1 min bars for this option for "yesterday" effectively
+                        # Note: For options, 'TRADES' might be sparse. 'BID_ASK' or 'MIDPOINT' might be better for liquidity assessment.
+                        # However, whatToShow='OPTION_IMPLIED_VOLATILITY' or 'HISTORICAL_VOLATILITY' for options.
+                        # For price bars, TRADES, BID, ASK, MIDPOINT are valid.
 
+                        # To get very recent data, endDateTime='' and a short duration e.g., '1 D' or '2 D'
+                        # For older data, specify endDateTime.
+                        # Let's try to get data for a recent period.
+                        hist_opt_data_df = client.fetch_historical_data(
+                            sample_option_contract,
+                            endDateTime='', # Current time
+                            durationStr='1 D', # Last day
+                            barSizeSetting='1 min', # 1 minute bars
+                            whatToShow='TRADES', # or 'MIDPOINT'
+                            useRTH=True
+                        )
+                        if hist_opt_data_df is not None and not hist_opt_data_df.empty:
+                            logger.info(f"Historical Data for Option {sample_option_contract.localSymbol} (first 5 rows):\n{hist_opt_data_df.head()}")
+                        else:
+                            logger.warning(f"No historical data returned for option {sample_option_contract.localSymbol}.")
+                else:
+                    logger.warning(f"No option chain contracts found for {underlying_sym} expiring {test_expiry_date}.")
+            else:
+                logger.error(f"Could not determine a suitable test_expiry_date for {underlying_sym}.")
+
+
+            # --- Test placing a paper order for an option (if chain was successful) ---
+            # Be very careful with live order placement, even paper.
+            # This part is commented out by default to prevent accidental order submission.
+            """
+            if option_chain and len(option_chain) > 0:
+                # Select a near-the-money call option for testing
+                underlying_price_approx = 350 # Assume QQQ price for selection
+                atm_call_options = [
+                    c for c in option_chain
+                    if c.right == 'C' and abs(c.strike - underlying_price_approx) < 10 # Strike within $10 of assumed ATM
+                ]
+                if atm_call_options:
+                    test_opt_to_order = atm_call_options[0] # Pick the first one
+                    logger.info(f"Selected option for paper order test: {test_opt_to_order.localSymbol}")
+
+                    option_order = MarketOrder(action='BUY', totalQuantity=1) # Buy 1 contract
+
+                    # Ensure the contract is fully qualified with conId before placing order
+                    # (fetch_option_chain should return qualified contracts with conId)
+                    if test_opt_to_order.conId:
+                        paper_trade_option = client.place_paper_order(test_opt_to_order, option_order)
+                        if paper_trade_option:
+                            logger.info(f"Paper order placed for option {test_opt_to_order.localSymbol}: {paper_trade_option}")
+                            logger.info(f"Order Status: {paper_trade_option.orderStatus.status}")
+                            # client.ib.sleep(5) # Wait for potential status updates
+                            # logger.info(f"Updated Order Status: {paper_trade_option.orderStatus.status}")
+                        else:
+                            logger.error(f"Failed to place paper order for option {test_opt_to_order.localSymbol}.")
+                    else:
+                        logger.error(f"Test option {test_opt_to_order.localSymbol} does not have conId, cannot place order.")
+                else:
+                    logger.warning("No suitable ATM call option found in the chain for paper order test.")
+            """
+
+        else:
+            logger.error("Failed to start or patch the event loop. Real-time updates will not work.")
 
     except ConnectionRefusedError:
-        logging.error("Connection refused. Ensure TWS/Gateway is running and API connections are enabled.")
-    except Exception as e:
-        logging.error(f"An error occurred in the main example: {e}", exc_info=True)
+        logger.error("Connection to IBKR refused. Is TWS/Gateway running and API enabled on the correct port?")
+    except Exception as main_e:
+        logger.error(f"An error occurred in the main example: {main_e}", exc_info=True)
     finally:
-        logging.info("Disconnecting client in finally block of __main__...")
-        if 'client' in locals() and client.ib.isConnected():
-             # If util.startLoop was used, it runs a daemon thread.
-             # Explicitly stopping the IB client loop may or may not be needed/possible
-             # depending on how it was started and if ib_insync handles it on disconnect.
-             # For util.startLoop, ib.disconnect() should be enough.
-             client.disconnect() # This will also cancel active subscriptions.
-        
-        # If a loop was started with ib.run() directly (not in a thread), you'd need ib.stop()
-        # if 'client' in locals() and client.ib.loop.is_running() and not util.isBackgroundLoop():
-        #    logging.info("Attempting to stop foreground IB event loop.")
-        #    client.ib.stop()
-
-        logging.info("IBKRClient example finished.")
+        if client.ib.isConnected():
+            logger.info("Disconnecting client in finally block...")
+            client.disconnect()
+        logger.info("IBKRClient option example finished.")
