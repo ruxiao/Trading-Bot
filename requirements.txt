@@ -1,11 +1,9 @@
-ib_insync>=0.9.86
-pandas>=2.2.0
-numpy # Often a dependency of pandas/other libraries, good to have explicitly
+numpy
+pandas
+torch
+yfinance
+matplotlib
 scikit-learn
-tensorflow
-pandas-ta
-pyarrow
-plotly # For potential visualizations, was in original description indirectly via PerformanceAnalyzer
-streamlit # For the UI, if we get to it
-pytest
-pytest-mock
+stable-baselines3[extra]
+gymnasium # For compatibility with Stable Baselines3, using Gymnasium is preferred over OpenAI Gym
+sb3-contrib # For LSTMPolicy if needed
