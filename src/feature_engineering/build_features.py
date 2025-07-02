@@ -2,6 +2,7 @@ import logging
 import os
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -90,7 +91,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df.ta.strategy(custom_strategy)
     logger.info(f"Shape after adding TA features: {df.shape}")
-    logger.info(f"Columns added: {custom_strategy.columns}")
+    logger.info(f"Columns after adding TA features: {df.columns.tolist()}")
 
     # --- Post-processing Features ---
     # 1. Handle NaNs:
@@ -112,13 +113,11 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     # Most indicators with length N will have N-1 NaNs. Longest length here is SMA_50 or ADX/AROON (14*2 for internal calcs).
     # psar also has warmup. CMF_20, etc.
     # Safest to drop any row that still has a NaN after all calculations.
-    df.dropna(inplace=True)
-    logger.info(f"Shape after dropping rows with NaNs: {df.shape}")
+    df.fillna(0, inplace=True)
+    logger.info(f"Shape after filling NaNs with 0: {df.shape}")
     final_nans = df.isna().sum().sum()
     if final_nans > 0: # Should be 0
-        logger.warning(f"Still {final_nans} NaN values after dropna. Check indicator calculations.")
-        # For robustness, fill any remaining with 0, though ideally dropna handles it.
-        df.fillna(0, inplace=True)
+        logger.warning(f"Still {final_nans} NaN values after filling with 0. Check indicator calculations.")
 
 
     # 2. Feature Scaling (Optional here, often done just before model training)

@@ -175,15 +175,14 @@ def apply_her(episodes: list, raw_prices_df: pd.DataFrame, default_goal_value: f
 
             # Augment state with goal. Goal is a single float.
             # For policy input, (s, g) will be concatenated or processed.
-            # Store as tuple (list_of_z_values, goal_value) for clarity in DataFrame.
-
+            # Store as a concatenated list [z_vector_elements..., goal_value]
             # 1. Original experience with a default intended goal
             # The reward is kept as original from the behavior policy
             augmented_experiences.append({
-                's_g_t': (s_t, default_goal_value), # State s_t, Intended Goal default_goal_value
+                's_g_t': s_t.tolist() + [default_goal_value], # State s_t, Intended Goal default_goal_value
                 'a_t': a_t,
                 'r_t': original_r_t,
-                's_g_next_t': (s_next_t, default_goal_value), # Next State s_next_t, Intended Goal default_goal_value
+                's_g_next_t': s_next_t.tolist() + [default_goal_value], # Next State s_next_t, Intended Goal default_goal_value
                 'done': done,
                 'is_her': False, # Mark as not a HER sample
                 'timestamp': timestamp_t
@@ -237,10 +236,10 @@ def apply_her(episodes: list, raw_prices_df: pd.DataFrame, default_goal_value: f
             her_done = her_goal_achieved_at_s_next
 
             augmented_experiences.append({
-                's_g_t': (s_t, hindsight_goal_value), # State s_t, Hindsight Goal
+                's_g_t': s_t.tolist() + [hindsight_goal_value], # State s_t, Hindsight Goal
                 'a_t': a_t,
                 'r_t': her_r_t,
-                's_g_next_t': (s_next_t, hindsight_goal_value), # Next State s_next_t, Hindsight Goal
+                's_g_next_t': s_next_t.tolist() + [hindsight_goal_value], # Next State s_next_t, Hindsight Goal
                 'done': her_done,
                 'is_her': True, # Mark as a HER sample
                 'timestamp': timestamp_t

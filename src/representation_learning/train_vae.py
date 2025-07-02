@@ -33,9 +33,9 @@ class Sampling(layers.Layer):
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
         epsilon = K.random_normal(shape=(batch, dim))
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        return z_mean + tf.keras.ops.exp(0.5 * z_log_var) * epsilon
 
-def build_vae(original_dim, latent_dim):
+def build_encoder_decoder(original_dim, latent_dim):
     # --- Encoder ---
     encoder_inputs = layers.Input(shape=(original_dim,), name="encoder_input")
     x = layers.Dense(128, activation="relu")(encoder_inputs)
@@ -63,25 +63,41 @@ def build_vae(original_dim, latent_dim):
     logger.info("Decoder summary:")
     decoder.summary(print_fn=logger.info)
 
-    # --- VAE Model ---
-    # Connect encoder and decoder
-    vae_outputs = decoder(encoder(encoder_inputs)[2]) # Use the sampled 'z' from encoder
-    vae = Model(encoder_inputs, vae_outputs, name="vae")
+    return encoder, decoder
 
-    # VAE Loss
-    reconstruction_loss = tf.reduce_mean(
-        tf.reduce_sum(
-            tf.keras.losses.mean_squared_error(encoder_inputs, vae_outputs), axis=-1 # Sum over features
-        )
-    ) * RECONSTRUCTION_WEIGHT # MSE is common, can also use binary_crossentropy if inputs are binary
+class CustomVAE(Model):
+    def __init__(self, encoder, decoder, reconstruction_weight, kl_weight, **kwargs):
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.reconstruction_weight = reconstruction_weight
+        self.kl_weight = kl_weight
 
-    kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-    kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1)) * KL_WEIGHT
+    def train_step(self, data):
+        if isinstance(data, tuple):
+            data = data[0]
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder(data)
+            reconstruction = self.decoder(z)
+            reconstruction_loss = tf.keras.ops.mean(
+                tf.keras.ops.sum(
+                    tf.keras.ops.square(data - reconstruction), axis=-1
+                )
+            ) * self.reconstruction_weight
 
-    total_loss = reconstruction_loss + kl_loss
-    vae.add_loss(total_loss)
+            kl_loss = -0.5 * (1 + z_log_var - tf.keras.ops.square(z_mean) - tf.keras.ops.exp(z_log_var))
+            kl_loss = tf.keras.ops.mean(tf.keras.ops.sum(kl_loss, axis=1)) * self.kl_weight
+            total_loss = reconstruction_loss + kl_loss
 
-    return vae, encoder, decoder
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        return {"loss": total_loss, "reconstruction_loss": reconstruction_loss, "kl_loss": kl_loss}
+
+    def call(self, inputs):
+        z_mean, z_log_var, z = self.encoder(inputs)
+        reconstruction = self.decoder(z)
+        return reconstruction
+
 
 def main():
     logger.info("Starting VAE training process...")
@@ -131,7 +147,8 @@ def main():
     logger.info(f"Training data shape: {x_train.shape}, Validation data shape: {x_val.shape}")
 
     # 3. Build VAE
-    vae, encoder, _ = build_vae(original_dim, LATENT_DIM) # We only need to save the encoder
+    encoder, decoder = build_encoder_decoder(original_dim, LATENT_DIM)
+    vae = CustomVAE(encoder, decoder, RECONSTRUCTION_WEIGHT, KL_WEIGHT)
 
     # Optimizer
     # Learning rate scheduling can be beneficial for VAEs
@@ -145,8 +162,7 @@ def main():
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     # optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
 
-
-    vae.compile(optimizer=optimizer) # Loss is added in the model definition
+    vae.compile(optimizer=optimizer, loss=tf.keras.losses.MeanSquaredError())
 
     # Callbacks
     early_stopping = tf.keras.callbacks.EarlyStopping(
@@ -171,7 +187,7 @@ def main():
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         validation_data=(x_val, x_val),
-        callbacks=[early_stopping, reduce_lr_on_plateau],
+        callbacks=[early_stopping],
         verbose=1
     )
 
@@ -235,15 +251,3 @@ if __name__ == "__main__":
         logger.info("No GPU found, using CPU.")
 
     main()
-
-```python
-# Example of how to load and use the encoder and scaler later:
-# scaler = joblib.load(VAE_SCALER_FILE)
-# encoder = tf.keras.models.load_model(VAE_ENCODER_FILE, custom_objects={'Sampling': Sampling})
-#
-# new_raw_features_df = pd.read_parquet(...) # Load new raw features
-# new_scaled_features = scaler.transform(new_raw_features_df[original_columns].values) # Use original_columns from training
-#
-# z_mean, z_log_var, z_sampled = encoder.predict(new_scaled_features)
-# state_vectors = z_mean # Or z_sampled
-```

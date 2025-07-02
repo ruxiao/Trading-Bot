@@ -40,14 +40,14 @@ TRADE_SIZE_PERCENT = 0.10 # Use 10% of capital per trade
 SLIPPAGE_PERCENT = 0.0005 # 0.05% slippage per transaction (buy or sell)
 TRANSACTION_COST_PERCENT = 0.0005 # 0.05% transaction cost per transaction
 
-class Sampling(layers.Layer): # Required for loading VAE encoder
+class Sampling(tf.keras.layers.Layer): # Required for loading VAE encoder
     """Uses (z_mean, z_log_var) to sample z."""
     def call(self, inputs):
         z_mean, z_log_var = inputs
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
-        epsilon = K.random_normal(shape=(batch, dim))
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        epsilon = tf.random.normal(shape=(batch, dim))
+        return z_mean + tf.keras.ops.exp(0.5 * z_log_var) * epsilon
 
 def load_data_and_models():
     """Loads features, raw prices, VAE encoder, and scaler."""
@@ -296,16 +296,5 @@ if __name__ == "__main__":
         logger.info("No GPU found, using CPU (VAE encoder prediction).")
     main()
 
-```
-A note on state representation `s_t`:
-The request mentions "Run a simple 'behavior policy' (e.g., MACD crossover) on the historical data to generate a base set of trajectories (s, a, r, s')."
-Here, `s` is the state vector `z` obtained from the VAE. The MACD policy itself will operate on the MACD values from the *feature* DataFrame, but the `s` recorded in the trajectory will be the compressed `z`.
 
-Reward Calculation:
-The current reward `r_t` is:
--   `-cost` if action is BUY (cost of transaction).
--   `trade_pnl` if action is SELL_EXIT (profit or loss from the trade).
--   `0` if action is HOLD.
-This is a common way to define rewards. For HER, goal-based rewards will be calculated later.
 
-This script is now quite comprehensive. It loads data, models, runs a basic simulation with a MACD strategy, and saves the experiences.

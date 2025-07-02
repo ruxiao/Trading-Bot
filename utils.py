@@ -29,7 +29,12 @@ def download_data(ticker, start_date, end_date, interval='1m'):
                          "For 5m/15m, ensure it's within the last 60 days.")
     print("Data download complete.")
     # Ensure column names are consistent and lowercase for easier access
-    data.columns = [col.lower() for col in data.columns]
+    # Flatten MultiIndex columns if they exist (common with yfinance)
+    print(f"Columns before flattening and lowercasing: {data.columns.tolist()}")
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = ['_'.join(col).strip() for col in data.columns.values]
+    data.columns = [col.lower().replace(f'_{ticker.lower()}', '') for col in data.columns]
+    print(f"Columns after flattening, lowercasing, and suffix removal: {data.columns.tolist()}")
     return data
 
 def preprocess_data(df):
@@ -49,14 +54,14 @@ def preprocess_data(df):
 
     # Make a copy of the original close prices before calculating indicators that might use it
     # or before it gets scaled. This will be used for trade execution.
-    df['close_unscaled'] = df['close']
+    df['close_unscaled'] = df['price_close']
 
     # Calculate basic technical indicators using the original 'close' column
-    df['sma_10'] = df['close'].rolling(window=10).mean()
-    df['sma_30'] = df['close'].rolling(window=30).mean()
-    df['rsi'] = compute_rsi(df['close'], 14)
-    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    df['volatility'] = df['close'].rolling(window=10).std()
+    df['sma_10'] = df['price_close'].rolling(window=10).mean()
+    df['sma_30'] = df['price_close'].rolling(window=30).mean()
+    df['rsi'] = compute_rsi(df['price_close'], 14)
+    df['macd'] = df['price_close'].ewm(span=12, adjust=False).mean() - df['price_close'].ewm(span=26, adjust=False).mean()
+    df['volatility'] = df['price_close'].rolling(window=10).std()
 
     # Drop rows with NaN values created by the rolling windows
     # This must be done BEFORE scaling, and 'close_unscaled' will also be affected (rows dropped).

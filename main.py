@@ -36,8 +36,8 @@ def main():
 
     # Training data: Target ~50 days of usable training data
     TRAIN_TARGET_DURATION_DAYS = 50
-    TRAIN_END_DATE_DT = datetime.datetime.now() - datetime.timedelta(days=10) # Ensure train data is not too recent
-    TRAIN_START_DATE_DT = TRAIN_END_DATE_DT - datetime.timedelta(days=TRAIN_TARGET_DURATION_DAYS + indicator_buffer_calendar_days -1)
+    TRAIN_END_DATE_DT = datetime.datetime.now() - datetime.timedelta(days=1) # Ensure train data is not too recent
+    TRAIN_START_DATE_DT = TRAIN_END_DATE_DT - datetime.timedelta(days=30) # Try a shorter period for data download
     # yfinance start is inclusive, end is exclusive for intraday. For daily, both inclusive? Let's be safe.
     # Using string formatting for yfinance for clarity.
     TRAIN_START_DATE_STR = TRAIN_START_DATE_DT.strftime('%Y-%m-%d')
@@ -47,7 +47,7 @@ def main():
     # Backtest data: Target 5 days of usable backtesting data
     BACKTEST_TARGET_DURATION_DAYS = 5
     BACKTEST_END_DATE_DT = datetime.datetime.now() - datetime.timedelta(days=1) # Yesterday
-    BACKTEST_START_DATE_DT = BACKTEST_END_DATE_DT - datetime.timedelta(days=BACKTEST_TARGET_DURATION_DAYS + indicator_buffer_calendar_days -1)
+    BACKTEST_START_DATE_DT = BACKTEST_END_DATE_DT - datetime.timedelta(days=5) # 5 days for backtest
     BACKTEST_START_DATE_STR = BACKTEST_START_DATE_DT.strftime('%Y-%m-%d')
     BACKTEST_END_DATE_STR = BACKTEST_END_DATE_DT.strftime('%Y-%m-%d')
 
@@ -83,10 +83,12 @@ def main():
     # --- 1. Data Loading and Preparation ---
     print("--- 1. Data Loading and Preparation ---")
     try:
+        print(f"Type of TICKER: {type(TICKER)}")
         print(f"Attempting to download training data: {TICKER} from {TRAIN_START_DATE_STR} to {TRAIN_END_DATE_STR} ({DATA_INTERVAL})")
         raw_train_data = download_data(TICKER, TRAIN_START_DATE_STR, TRAIN_END_DATE_STR, interval=DATA_INTERVAL)
 
-        print(f"\nAttempting to download backtesting data: {TICKER} from {BACKTEST_START_DATE_STR} to {BACKTEST_END_DATE_STR} ({DATA_INTERVAL})")
+        print(f"
+Attempting to download backtesting data: {TICKER} from {BACKTEST_START_DATE_STR} to {BACKTEST_END_DATE_STR} ({DATA_INTERVAL})"
         raw_backtest_data = download_data(TICKER, BACKTEST_START_DATE_STR, BACKTEST_END_DATE_STR, interval=DATA_INTERVAL)
 
     except ValueError as e:

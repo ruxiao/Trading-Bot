@@ -2,6 +2,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 import pandas as pd
+from typing import Optional
 
 from ib_insync import IB, Stock, util
 

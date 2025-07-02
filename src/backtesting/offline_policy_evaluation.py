@@ -20,14 +20,7 @@ CQL_CRITIC_FILE = os.path.join(RL_MODEL_DIR, "cql_critic_goal_conditioned.h5") #
 # OPE Configuration
 TEST_SET_SIZE = 0.2 # Use 20% of the augmented data as a pseudo-test set for OPE
 
-# --- Helper function to unpack state-goal tuples from DataFrame column ---
-def unpack_s_g_column_for_ope(df_column):
-    # df_column contains tuples of (list_of_z_values, goal_value)
-    z_vectors = np.array([item[0] for item in df_column])
-    goals = np.array([item[1] for item in df_column]).reshape(-1, 1) # GOAL_DIM is 1
-    # Concatenate z and g to form the input for the models
-    s_g_vectors = np.concatenate([z_vectors, goals], axis=1).astype(np.float32)
-    return s_g_vectors
+
 
 def load_data_and_models_for_ope():
     logger.info("Loading data and models for OPE...")
@@ -57,8 +50,8 @@ def load_data_and_models_for_ope():
             logger.error("Test DataFrame is empty after split.")
             return None, None, None
 
-        # Unpack s_g_t for the test set
-        s_g_test = unpack_s_g_column_for_ope(test_df['s_g_t'])
+        # Use the s_g_t column directly as it now contains the combined state-goal vector
+        s_g_test = np.array(test_df['s_g_t'].tolist(), dtype=np.float32)
 
         # Load trained models
         actor = tf.keras.models.load_model(CQL_ACTOR_FILE)
@@ -137,15 +130,6 @@ if __name__ == "__main__":
         logger.info("No GPU found, using CPU for OPE.")
 
     main()
-```
 
-Now for `src/backtesting/run_cql_backtest.py`. This is more complex.
-I'll need:
-*   The VAE-related components: `Sampling` class, VAE encoder, feature scaler.
-*   The feature calculation logic (or a way to call it).
-*   The CQL actor model.
-*   Logic for dynamic goal setting (e.g., based on ATR).
-*   A backtesting loop.
-*   Performance calculation.
 
-For the "unseen data", I'll modify the script to load `qqq_1min_1month.csv` and then split it: use the first part for generating features for training (as done by `build_features.py`) and the latter part for this backtest. This requires careful indexing. The `build_features.py` script would ideally also take start/end dates to formalize this. For now, I'll assume `run_cql_backtest.py` will handle loading the full raw data and selecting the "unseen" portion for its run. It will then compute features on-the-fly for this portion.
+

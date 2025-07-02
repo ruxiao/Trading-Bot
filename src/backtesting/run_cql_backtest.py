@@ -239,6 +239,8 @@ def run_backtest_simulation(
         action_probs = cql_actor.predict(state_goal_input)[0]
         chosen_action = np.argmax(action_probs) # Greedy action
 
+        logger.debug(f"Timestamp: {timestamp}, State-Goal Input: {state_goal_input}, Chosen Action: {chosen_action}, Current Goal: {current_goal}")
+
         # Trade Execution Logic
         trade_executed_this_step = None
         if chosen_action == ACTION_BUY and not in_position:
